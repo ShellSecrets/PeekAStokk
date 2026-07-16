@@ -659,6 +659,9 @@ function onLine(msg) {
   try { ev = JSON.parse(msg.data); } catch { return; }
   if (typeof ev.seq !== "number" || ev.seq <= lastSeq) return; // replay dedupe
   lastSeq = ev.seq;
+  // A timestamp means "seen arriving live"; replayed history was not, so
+  // it renders with the · marker like disk-backfilled lines.
+  if (ev.replay) ev.time = null;
   const f = ensureFile(ev.file);
   if (!f.enabled) return; // server filters; this guards fallback modes
   const floor = floors.get(ev.file);

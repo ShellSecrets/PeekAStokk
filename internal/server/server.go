@@ -186,7 +186,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	defer s.log.Debug("sse client disconnected", "remote", r.RemoteAddr)
 
 	for _, ev := range history {
-		if s.writeEvent(w, ev) != nil {
+		if s.writeEvent(w, ev, true) != nil {
 			return
 		}
 	}
@@ -217,13 +217,13 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 // writeBatch writes first plus any events already queued (up to batchLimit)
 // and flushes once. It reports whether streaming should continue.
 func (s *Server) writeBatch(w io.Writer, flusher http.Flusher, sub *hub.Subscriber, first hub.Event) bool {
-	if s.writeEvent(w, first) != nil {
+	if s.writeEvent(w, first, false) != nil {
 		return false
 	}
 	for i := 0; i < batchLimit; i++ {
 		select {
 		case ev, open := <-sub.Events():
-			if !open || s.writeEvent(w, ev) != nil {
+			if !open || s.writeEvent(w, ev, false) != nil {
 				flusher.Flush()
 				return false
 			}
@@ -237,15 +237,19 @@ func (s *Server) writeBatch(w io.Writer, flusher http.Flusher, sub *hub.Subscrib
 }
 
 // writeEvent serializes ev for the wire, replacing the internal file path
-// with its opaque id.
-func (s *Server) writeEvent(w io.Writer, ev hub.Event) error {
+// with its opaque id. replay marks events the client did not observe live
+// (history sent on connect/reconnect); the UI shows those without a
+// timestamp, since the recorded time is when the server read the line, not
+// when it happened.
+func (s *Server) writeEvent(w io.Writer, ev hub.Event, replay bool) error {
 	wire := struct {
-		Seq  uint64    `json:"seq"`
-		File string    `json:"file"` // opaque id, never the path
-		Text string    `json:"text"`
-		Off  int64     `json:"off"`
-		Time time.Time `json:"time"`
-	}{ev.Seq, s.idByPath[ev.File], ev.Text, ev.Off, ev.Time}
+		Seq    uint64    `json:"seq"`
+		File   string    `json:"file"` // opaque id, never the path
+		Text   string    `json:"text"`
+		Off    int64     `json:"off"`
+		Time   time.Time `json:"time"`
+		Replay bool      `json:"replay,omitempty"`
+	}{ev.Seq, s.idByPath[ev.File], ev.Text, ev.Off, ev.Time, replay}
 	data, err := json.Marshal(wire)
 	if err != nil {
 		return err

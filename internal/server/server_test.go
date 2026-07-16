@@ -226,6 +226,46 @@ func TestEventStreamRejectsBadFilesFilter(t *testing.T) {
 	}
 }
 
+// TestReplayFlagMarksHistoryOnly: history sent on connect is flagged
+// replay:true (the UI hides its meaningless timestamps); live events are
+// not flagged.
+func TestReplayFlagMarksHistoryOnly(t *testing.T) {
+	h := hub.New(10)
+	h.Publish("a.log", "old", 0, time.Now())
+	ts := newTestServer(t, h)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/events", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	readData := func(r *bufio.Reader) string {
+		t.Helper()
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				t.Fatalf("stream ended: %v", err)
+			}
+			if strings.HasPrefix(line, "data: ") {
+				return line
+			}
+		}
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	if history := readData(reader); !strings.Contains(history, `"replay":true`) {
+		t.Errorf("history event not marked replay: %s", history)
+	}
+	h.Publish("a.log", "fresh", 0, time.Now())
+	if live := readData(reader); strings.Contains(live, `"replay"`) {
+		t.Errorf("live event wrongly marked replay: %s", live)
+	}
+}
+
 // TestNoPathDisclosure locks in the privacy contract: absolute paths of
 // tailed files must never appear in anything sent to a client.
 func TestNoPathDisclosure(t *testing.T) {
