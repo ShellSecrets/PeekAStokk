@@ -35,7 +35,7 @@ func newBackfillServer(t *testing.T) (*httptest.Server, string) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(server.New(hub.New(10), []string{path}, 500, nil).Handler())
+	ts := httptest.NewServer(server.New(hub.New(10), server.Options{Files: []string{path}, Lines: 500}).Handler())
 	t.Cleanup(ts.Close)
 	return ts, path
 }
@@ -114,7 +114,7 @@ func TestBackfillDropsUnterminatedTrailingLine(t *testing.T) {
 	if err := os.WriteFile(path, []byte("done\nno newline yet"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(server.New(hub.New(10), []string{path}, 500, nil).Handler())
+	ts := httptest.NewServer(server.New(hub.New(10), server.Options{Files: []string{path}, Lines: 500}).Handler())
 	t.Cleanup(ts.Close)
 
 	status, body := getBefore(t, ts, url.Values{"file": {"0"}})
@@ -140,7 +140,7 @@ func TestBackfillRefusesUntailedFiles(t *testing.T) {
 
 func TestBackfillOnMissingTailedFileIsEmptyAtStart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "future.log") // tailed, not created yet
-	ts := httptest.NewServer(server.New(hub.New(10), []string{path}, 500, nil).Handler())
+	ts := httptest.NewServer(server.New(hub.New(10), server.Options{Files: []string{path}, Lines: 500}).Handler())
 	t.Cleanup(ts.Close)
 
 	status, body := getBefore(t, ts, url.Values{"file": {"0"}})

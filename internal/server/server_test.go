@@ -12,13 +12,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shellsecrets/peekastokk/internal/auth"
 	"github.com/shellsecrets/peekastokk/internal/hub"
 	"github.com/shellsecrets/peekastokk/internal/server"
 )
 
 func newTestServer(t *testing.T, h *hub.Hub) *httptest.Server {
 	t.Helper()
-	ts := httptest.NewServer(server.New(h, []string{"a.log", "b.log"}, 500, nil).Handler())
+	ts := httptest.NewServer(server.New(h, server.Options{Files: []string{"a.log", "b.log"}, Lines: 500}).Handler())
 	t.Cleanup(ts.Close)
 	return ts
 }
@@ -226,6 +227,118 @@ func TestEventStreamRejectsBadFilesFilter(t *testing.T) {
 	}
 }
 
+func TestBasicAuth(t *testing.T) {
+	h := hub.New(10)
+	h.Publish("a.log", "secret line", 0, time.Now())
+	ts := httptest.NewServer(server.New(h, server.Options{
+		Files: []string{"a.log"}, Lines: 500,
+		AuthUser: "dev", AuthPass: "s3cret",
+	}).Handler())
+	t.Cleanup(ts.Close)
+
+	get := func(path, user, pass string) *http.Response {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+path, nil)
+		if user != "" {
+			req.SetBasicAuth(user, pass)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	// Every surface is protected...
+	for _, path := range []string{"/", "/api/files", "/api/before?file=0", "/events"} {
+		resp := get(path, "", "")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s without creds: status = %d, want 401", path, resp.StatusCode)
+		}
+		if !strings.Contains(resp.Header.Get("WWW-Authenticate"), "Basic") {
+			t.Errorf("%s: missing WWW-Authenticate challenge", path)
+		}
+	}
+
+	// ...wrong credentials are rejected...
+	for _, c := range [][2]string{{"dev", "wrong"}, {"wrong", "s3cret"}, {"", "s3cret"}} {
+		resp := get("/api/files", c[0]+"x", c[1]) // +x guards the empty-user case
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("creds %v: status = %d, want 401", c, resp.StatusCode)
+		}
+	}
+
+	// ...correct credentials work, including on the stream.
+	resp := get("/api/files", "dev", "s3cret")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("valid creds: status = %d, want 200", resp.StatusCode)
+	}
+	stream := get("/events", "dev", "s3cret")
+	defer stream.Body.Close()
+	if stream.StatusCode != http.StatusOK {
+		t.Errorf("stream with creds: status = %d", stream.StatusCode)
+	}
+	events := readEvents(t, bufio.NewReader(stream.Body), 1)
+	if events[0].Text != "secret line" {
+		t.Errorf("stream = %+v", events[0])
+	}
+
+	// Health checks stay open for load balancers.
+	resp = get("/healthz", "", "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("/healthz should not require auth, got %d", resp.StatusCode)
+	}
+}
+
+func TestBasicAuthWithArgon2Hash(t *testing.T) {
+	hash, err := auth.HashPassword("s3cret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(server.New(hub.New(10), server.Options{
+		Files: []string{"a.log"}, Lines: 500,
+		AuthUser: "dev", AuthPass: hash,
+	}).Handler())
+	t.Cleanup(ts.Close)
+
+	get := func(user, pass string) int {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/files", nil)
+		if user != "" {
+			req.SetBasicAuth(user, pass)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := get("", ""); code != http.StatusUnauthorized {
+		t.Errorf("no creds: %d, want 401", code)
+	}
+	if code := get("dev", "wrong"); code != http.StatusUnauthorized {
+		t.Errorf("wrong password: %d, want 401", code)
+	}
+	// First correct attempt runs the slow KDF; the second hits the cache.
+	for i := 0; i < 2; i++ {
+		if code := get("dev", "s3cret"); code != http.StatusOK {
+			t.Errorf("attempt %d with correct password: %d, want 200", i+1, code)
+		}
+	}
+	// The cache must not have weakened anything.
+	if code := get("dev", "still wrong"); code != http.StatusUnauthorized {
+		t.Errorf("wrong password after cache warm: %d, want 401", code)
+	}
+}
+
 // TestReplayFlagMarksHistoryOnly: history sent on connect is flagged
 // replay:true (the UI hides its meaningless timestamps); live events are
 // not flagged.
@@ -277,7 +390,7 @@ func TestNoPathDisclosure(t *testing.T) {
 
 	h := hub.New(10)
 	h.Publish(path, "streamed line", 0, time.Now())
-	ts := httptest.NewServer(server.New(h, []string{path}, 500, nil).Handler())
+	ts := httptest.NewServer(server.New(h, server.Options{Files: []string{path}, Lines: 500}).Handler())
 	t.Cleanup(ts.Close)
 
 	fetch := func(url string) string {

@@ -52,6 +52,7 @@ type Config struct {
 	TailBytes    int64
 	MaxLineBytes int
 	LogLevel     string
+	Auth         string // "user:password"; empty means no authentication
 	Files        []string
 
 	present map[string]bool
@@ -59,7 +60,7 @@ type Config struct {
 
 // Has reports whether key appeared in the file. Keys match the flag names:
 // "addr", "port", "history", "lines", "poll", "tail-bytes",
-// "max-line-bytes", "log-level", "file".
+// "max-line-bytes", "log-level", "auth", "file".
 func (c *Config) Has(key string) bool { return c.present[key] }
 
 // Load reads the configuration from explicitPath or, when it is empty, from
@@ -172,6 +173,11 @@ func parse(text, baseDir string) (*Config, error) {
 			var lvl slog.Level
 			err = lvl.UnmarshalText([]byte(value))
 			c.LogLevel = value
+		case "auth":
+			if user, pass, ok := strings.Cut(value, ":"); !ok || user == "" || pass == "" {
+				err = errors.New(`must be "user:password" with both parts non-empty`)
+			}
+			c.Auth = value
 		case "file":
 			var p string
 			p, err = resolveFilePath(value, baseDir)

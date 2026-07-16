@@ -38,6 +38,28 @@ max-line-bytes = 262144
 # debug, info, warn, or error.
 log-level = info
 
+# Require a username and password to view the logs (HTTP basic auth).
+# Off by default — uncomment "auth" below to enable; -auth "" on the
+# command line overrides this back to open access.
+#
+# Generate the hashed password like this (prompts twice, input hidden):
+#
+#   $ peekastokk -hash-password
+#   Password:
+#   Repeat password:
+#   $argon2id$v=19$m=65536,t=3,p=4$mvaJfpeyc7nZ7uf3e4Vb2g$0Fyiy...
+#
+# then paste it after "<username>:" — no quotes needed:
+#
+#   auth = dev:$argon2id$v=19$m=65536,t=3,p=4$mvaJfpeyc7nZ7uf3e4Vb2g$0Fyiy...
+#
+# (Scripts can pipe instead: echo 'pw' | peekastokk -hash-password)
+#
+# A plaintext password also works (auth = dev:changeme) but logs a startup
+# warning. Basic auth is sent as-is over plain HTTP: put a TLS proxy in
+# front when exposing beyond localhost.
+#auth = dev:$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHRzYWx0c2FsdA$...
+
 # Log files to tail: repeat "file" once per entry. A leading ~ expands to
 # your home directory; relative paths resolve against this file's
 # directory. Plain files that do not exist yet are waited for.

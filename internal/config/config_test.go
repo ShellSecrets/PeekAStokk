@@ -109,6 +109,9 @@ func TestLoadRejectsBadInput(t *testing.T) {
 		"bad lines":        "lines = 0\n",
 		"bad poll":         "poll = fast\n",
 		"bad log level":    "log-level = loud\n",
+		"auth no colon":    "auth = devonly\n",
+		"auth empty user":  "auth = :pass\n",
+		"auth empty pass":  "auth = dev:\n",
 		"duplicate scalar": "port = 1\nport = 2\n",
 		"addr and port":    "addr = :9000\nport = 9000\n",
 		"empty file value": "file =\n",
@@ -123,6 +126,20 @@ func TestLoadRejectsBadInput(t *testing.T) {
 				t.Fatalf("expected error for %q", content)
 			}
 		})
+	}
+}
+
+func TestLoadAuth(t *testing.T) {
+	isolateHome(t)
+	path := filepath.Join(t.TempDir(), "config")
+	writeFile(t, path, "auth = dev:s3cret\n")
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Has("auth") || cfg.Auth != "dev:s3cret" {
+		t.Errorf("Auth = %q", cfg.Auth)
 	}
 }
 

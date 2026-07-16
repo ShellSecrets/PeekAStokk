@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -21,6 +22,9 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/term"
+
+	"github.com/shellsecrets/peekastokk/internal/auth"
 	"github.com/shellsecrets/peekastokk/internal/config"
 	"github.com/shellsecrets/peekastokk/internal/hub"
 	"github.com/shellsecrets/peekastokk/internal/server"
@@ -46,15 +50,17 @@ func main() {
 
 func run() error {
 	var (
-		addr        = flag.String("addr", "127.0.0.1:8844", "HTTP listen address")
-		historySize = flag.Int("history", 2000, "number of recent lines replayed to newly connected browsers")
-		uiLines     = flag.Int("lines", 500, "default number of lines the web UI keeps on screen (adjustable in the UI)")
-		poll        = flag.Duration("poll", 200*time.Millisecond, "how often tailed files are checked for new data")
-		tailBytes   = flag.Int64("tail-bytes", 64*1024, "maximum bytes of existing content replayed per file at startup (negative starts at end of file)")
-		maxLine     = flag.Int("max-line-bytes", 256*1024, "lines longer than this are split into chunks")
-		logLevel    = flag.String("log-level", "info", "log level: debug, info, warn, or error")
-		configPath  = flag.String("config", "", "path to a config file (default: search the standard locations)")
-		showVersion = flag.Bool("version", false, "print version and exit")
+		addr         = flag.String("addr", "127.0.0.1:8844", "HTTP listen address")
+		historySize  = flag.Int("history", 2000, "number of recent lines replayed to newly connected browsers")
+		uiLines      = flag.Int("lines", 500, "default number of lines the web UI keeps on screen (adjustable in the UI)")
+		poll         = flag.Duration("poll", 200*time.Millisecond, "how often tailed files are checked for new data")
+		tailBytes    = flag.Int64("tail-bytes", 64*1024, "maximum bytes of existing content replayed per file at startup (negative starts at end of file)")
+		maxLine      = flag.Int("max-line-bytes", 256*1024, "lines longer than this are split into chunks")
+		logLevel     = flag.String("log-level", "info", "log level: debug, info, warn, or error")
+		authFlag     = flag.String("auth", "", `require HTTP basic auth to view logs, format "user:password" or "user:$argon2id$..." (empty disables; default). Prefer the config file, with a hash from -hash-password`)
+		hashPassword = flag.Bool("hash-password", false, "prompt for a password, print its Argon2id hash for the auth setting, and exit")
+		configPath   = flag.String("config", "", "path to a config file (default: search the standard locations)")
+		showVersion  = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(),
@@ -72,6 +78,9 @@ func run() error {
 	if *showVersion {
 		fmt.Println("peekastokk", version)
 		return nil
+	}
+	if *hashPassword {
+		return runHashPassword()
 	}
 
 	cfg, err := config.Load(*configPath)
@@ -116,6 +125,20 @@ func run() error {
 		if !fromCLI["log-level"] && cfg.Has("log-level") {
 			*logLevel = cfg.LogLevel
 		}
+		// -auth "" on the command line deliberately disables auth from the
+		// config, per the usual flags-beat-config rule.
+		if !fromCLI["auth"] && cfg.Has("auth") {
+			*authFlag = cfg.Auth
+		}
+	}
+
+	var authUser, authPass string
+	if *authFlag != "" {
+		user, pass, ok := strings.Cut(*authFlag, ":")
+		if !ok || user == "" || pass == "" {
+			return errors.New(`-auth must be "user:password" with both parts non-empty`)
+		}
+		authUser, authPass = user, pass
 	}
 
 	var level slog.Level
@@ -186,9 +209,21 @@ func run() error {
 		}
 	}()
 
+	if authUser != "" {
+		logger.Info("basic authentication enabled", "user", authUser)
+		if !auth.IsHash(authPass) {
+			logger.Warn("auth password is stored in plaintext; generate a hash with: peekastokk -hash-password")
+		}
+	}
 	httpSrv := &http.Server{
-		Addr:              *addr,
-		Handler:           server.New(h, paths, *uiLines, logger).Handler(),
+		Addr: *addr,
+		Handler: server.New(h, server.Options{
+			Files:    paths,
+			Lines:    *uiLines,
+			AuthUser: authUser,
+			AuthPass: authPass,
+			Logger:   logger,
+		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -227,6 +262,51 @@ func run() error {
 	tailers.Wait()
 	close(lines)
 	<-publisherDone
+	return nil
+}
+
+// runHashPassword prompts for a password (hidden when stdin is a terminal,
+// read as one line when piped) and prints its Argon2id hash, ready for the
+// "auth" setting.
+func runHashPassword() error {
+	readOne := func(prompt string) (string, error) {
+		fd := int(os.Stdin.Fd())
+		if term.IsTerminal(fd) {
+			fmt.Fprint(os.Stderr, prompt)
+			b, err := term.ReadPassword(fd)
+			fmt.Fprintln(os.Stderr)
+			return string(b), err
+		}
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && line == "" {
+			return "", err
+		}
+		return strings.TrimRight(line, "\r\n"), nil
+	}
+
+	pw, err := readOne("Password: ")
+	if err != nil {
+		return fmt.Errorf("reading password: %w", err)
+	}
+	if pw == "" {
+		return errors.New("password must not be empty")
+	}
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		again, err := readOne("Repeat password: ")
+		if err != nil {
+			return fmt.Errorf("reading password: %w", err)
+		}
+		if pw != again {
+			return errors.New("passwords do not match")
+		}
+	}
+
+	hash, err := auth.HashPassword(pw)
+	if err != nil {
+		return err
+	}
+	fmt.Println(hash)
+	fmt.Fprintf(os.Stderr, "\nPut this in your config file:\n\n\tauth = youruser:%s\n", hash)
 	return nil
 }
 

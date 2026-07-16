@@ -7,6 +7,8 @@
 package server
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -15,8 +17,10 @@ import (
 	"net/http"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
+	"github.com/shellsecrets/peekastokk/internal/auth"
 	"github.com/shellsecrets/peekastokk/internal/hub"
 )
 
@@ -42,6 +46,22 @@ type fileEntry struct {
 	Name string `json:"name"`
 }
 
+// Options configure a Server.
+type Options struct {
+	// Files is the list of tailed paths.
+	Files []string
+	// Lines is the default number of lines the UI keeps on screen.
+	Lines int
+	// AuthUser/AuthPass enable HTTP basic authentication for everything
+	// except /healthz. An empty AuthUser disables authentication. AuthPass
+	// is either the plaintext password or an Argon2id hash in PHC format
+	// (produced by peekastokk -hash-password).
+	AuthUser string
+	AuthPass string
+	// Logger defaults to slog.Default().
+	Logger *slog.Logger
+}
+
 // Server serves the embedded UI, the event stream, and small JSON APIs.
 type Server struct {
 	hub      *hub.Hub
@@ -49,28 +69,42 @@ type Server struct {
 	pathByID map[string]string // opaque id -> tailed path (server-side only)
 	idByPath map[string]string
 	lines    int
-	log      *slog.Logger
-	mux      *http.ServeMux
+	authUser string
+	authPass string // plaintext or argon2id PHC hash
+
+	// verifiedPass caches the SHA-256 of the password that last passed the
+	// deliberately slow Argon2id verification, so the KDF runs once per
+	// process rather than on every request. Guarded by authMu; verifyMu
+	// serializes the slow verifications themselves so a flood of wrong
+	// passwords is bounded to one KDF at a time.
+	authMu       sync.Mutex
+	verifyMu     sync.Mutex
+	verifiedPass [sha256.Size]byte
+	verifiedSet  bool
+
+	log *slog.Logger
+	mux *http.ServeMux
 }
 
-// New builds a Server streaming from h; files is the list of tailed paths
-// and lines is the default number of lines the UI keeps on screen (the
-// user can change it there).
-func New(h *hub.Hub, files []string, lines int, logger *slog.Logger) *Server {
-	if logger == nil {
-		logger = slog.Default()
+// New builds a Server streaming from h.
+func New(h *hub.Hub, opts Options) *Server {
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
 	}
-	if lines <= 0 {
-		lines = 500
+	if opts.Lines <= 0 {
+		opts.Lines = 500
 	}
+	files := opts.Files
 	names := displayNames(files)
 	s := &Server{
 		hub:      h,
 		entries:  make([]fileEntry, len(files)),
 		pathByID: make(map[string]string, len(files)),
 		idByPath: make(map[string]string, len(files)),
-		lines:    lines,
-		log:      logger,
+		lines:    opts.Lines,
+		authUser: opts.AuthUser,
+		authPass: opts.AuthPass,
+		log:      opts.Logger,
 		mux:      http.NewServeMux(),
 	}
 	for i, path := range files {
@@ -87,8 +121,78 @@ func New(h *hub.Hub, files []string, lines int, logger *slog.Logger) *Server {
 	return s
 }
 
-// Handler returns the root handler for use with an http.Server.
-func (s *Server) Handler() http.Handler { return s.mux }
+// Handler returns the root handler for use with an http.Server, wrapped in
+// basic authentication when credentials are configured.
+func (s *Server) Handler() http.Handler {
+	if s.authUser == "" {
+		return s.mux
+	}
+	return s.requireBasicAuth(s.mux)
+}
+
+// requireBasicAuth guards every route except /healthz (load balancers need
+// to probe unauthenticated). Credentials are compared in constant time via
+// digests, so neither the comparison nor the length leaks timing.
+func (s *Server) requireBasicAuth(next http.Handler) http.Handler {
+	wantUser := sha256.Sum256([]byte(s.authUser))
+	passIsHash := auth.IsHash(s.authPass)
+	var wantPass [sha256.Size]byte
+	if !passIsHash {
+		wantPass = sha256.Sum256([]byte(s.authPass))
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if user, pass, ok := r.BasicAuth(); ok {
+			gotUser := sha256.Sum256([]byte(user))
+			userOK := subtle.ConstantTimeCompare(gotUser[:], wantUser[:]) == 1
+			var passOK bool
+			if passIsHash {
+				passOK = s.checkHashedPassword(pass)
+			} else {
+				gotPass := sha256.Sum256([]byte(pass))
+				passOK = subtle.ConstantTimeCompare(gotPass[:], wantPass[:]) == 1
+			}
+			if userOK && passOK {
+				next.ServeHTTP(w, r)
+				return
+			}
+			s.log.Warn("rejected credentials", "remote", r.RemoteAddr, "user", user)
+		}
+		w.Header().Set("WWW-Authenticate", `Basic realm="PeekAStokk", charset="UTF-8"`)
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+	})
+}
+
+// checkHashedPassword verifies pass against the stored Argon2id hash. The
+// digest of an accepted password is cached, so basic auth's
+// credential-on-every-request pattern pays the slow KDF once per process.
+func (s *Server) checkHashedPassword(pass string) bool {
+	digest := sha256.Sum256([]byte(pass))
+
+	s.authMu.Lock()
+	cached, cachedSet := s.verifiedPass, s.verifiedSet
+	s.authMu.Unlock()
+	if cachedSet && subtle.ConstantTimeCompare(digest[:], cached[:]) == 1 {
+		return true
+	}
+
+	s.verifyMu.Lock()
+	ok, err := auth.VerifyPassword(pass, s.authPass)
+	s.verifyMu.Unlock()
+	if err != nil {
+		s.log.Error("stored auth hash is invalid", "error", err)
+		return false
+	}
+	if ok {
+		s.authMu.Lock()
+		s.verifiedPass, s.verifiedSet = digest, true
+		s.authMu.Unlock()
+	}
+	return ok
+}
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

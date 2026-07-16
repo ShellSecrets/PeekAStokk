@@ -4,7 +4,8 @@ Live log viewer in the browser. Point it at one or more log files and watch
 them stream in a single web UI — with filtering, per-file toggles, pause, and
 error/warning highlighting.
 
-Written in Go with **zero external dependencies** (standard library only).
+Written in Go with almost no dependencies — the standard library plus
+`golang.org/x/crypto` (Argon2id password hashing for the optional auth).
 
 ## Quick start
 
@@ -113,6 +114,7 @@ config file's `file` list entirely.
 | `-tail-bytes`     | `65536`          | Max bytes of existing content replayed per file at startup; negative starts at the end |
 | `-max-line-bytes` | `262144`         | Lines longer than this are split into chunks                    |
 | `-log-level`      | `info`           | `debug`, `info`, `warn`, or `error`                             |
+| `-auth`           | (off)            | Require HTTP basic auth, `user:password`; empty disables        |
 | `-config`         | (searched)       | Explicit config file path                                       |
 | `-version`        |                  | Print version and exit                                          |
 
@@ -126,11 +128,36 @@ config file's `file` list entirely.
 | `/api/before`| Older lines read from disk for scrollback (`file`, `offset`, `limit`) — only tailed files are readable |
 | `/healthz`   | Health check                         |
 
+## Authentication
+
+By default the UI is open (no auth) — fine for localhost. To require a
+username and password, generate an Argon2id hash and put it in the config:
+
+```sh
+peekastokk -hash-password       # prompts, prints $argon2id$v=19$m=65536,...
+```
+
+```ini
+auth = dev:$argon2id$v=19$m=65536,t=3,p=4$...   ; config file (preferred)
+```
+
+A plaintext password also works (`auth = dev:s3cret`, or
+`-auth dev:s3cret` — visible in process lists) but logs a warning at
+startup nudging you toward the hash.
+
+The browser prompts once and everything — UI, live stream, scrollback — is
+protected; `/healthz` stays open for load-balancer probes. `-auth ""` on
+the command line overrides the config back to open access. Credentials are
+compared in constant time, the slow hash verification is cached per process
+and serialized (no CPU-burn from brute-force floods), and rejected attempts
+are logged.
+
 ## Security note
 
-PeekAStokk serves whatever it tails, without authentication. It binds to
-`127.0.0.1` by default; if you expose it on another interface with `-addr`,
-put it behind a reverse proxy that handles auth/TLS.
+PeekAStokk serves whatever it tails. It binds to `127.0.0.1` by default;
+if you expose it on another interface with `-addr`, enable `auth` — and
+since basic auth is sent as-is over plain HTTP, put it behind a reverse
+proxy that handles TLS.
 
 Absolute file paths never leave the server: clients (and anything
 inspecting the traffic) only ever see opaque file ids and base names
