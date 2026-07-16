@@ -279,6 +279,25 @@ function clampLines(n) {
 // Files are known only by an opaque server-assigned id and a display name;
 // absolute paths never reach the browser.
 const files = new Map(); // id -> {id, name, color, count, enabled, itemEl, countEl}
+
+// The selection survives reloads, stored per browser by display name (ids
+// are positional and could shift between server runs).
+const SELECTED_KEY = "peekastokk.selected";
+let initialSelection = null; // Set of names to restore, only during init
+
+function savedSelection() {
+  try {
+    const v = JSON.parse(localStorage.getItem(SELECTED_KEY));
+    return Array.isArray(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistSelection() {
+  const names = [...files.values()].filter((f) => f.enabled).map((f) => f.name);
+  try { localStorage.setItem(SELECTED_KEY, JSON.stringify(names)); } catch {}
+}
 let events = [];
 let lastSeq = 0;
 let filter = "";
@@ -321,9 +340,9 @@ function ensureFile(id, name) {
     name: name || "log " + id,
     color: PALETTE[files.size % PALETTE.length],
     count: 0,
-    // Only the first file starts visible; the rest cost nothing until
-    // selected in the dropdown.
-    enabled: files.size === 0,
+    // A remembered selection wins; otherwise only the first file starts
+    // visible and the rest cost nothing until selected in the dropdown.
+    enabled: initialSelection ? initialSelection.has(name) : files.size === 0,
   };
   const item = document.createElement("div");
   item.className = "fileItem" + (f.enabled ? " on" : "");
@@ -662,6 +681,7 @@ async function toggleFile(f) {
   f.enabled = !f.enabled;
   f.itemEl.classList.toggle("on", f.enabled);
   updateFileButton();
+  persistSelection();
 
   if (!f.enabled) {
     events = events.filter((e) => e.file !== f.id);
@@ -811,7 +831,17 @@ document.addEventListener("keydown", (e) => {
 async function init() {
   try {
     const d = await (await fetch("/api/files")).json();
-    (d.files || []).forEach((entry) => ensureFile(entry.id, entry.name));
+    const entries = d.files || [];
+    // Restore the remembered selection, keeping only names that still
+    // exist; when nothing usable is stored, the first-file default applies.
+    const saved = savedSelection();
+    if (saved && saved.length) {
+      const known = new Set(entries.map((e) => e.name));
+      const matching = saved.filter((n) => known.has(n));
+      if (matching.length) initialSelection = new Set(matching);
+    }
+    entries.forEach((entry) => ensureFile(entry.id, entry.name));
+    initialSelection = null;
     if (localStorage.getItem(LINES_KEY) === null && Number.isInteger(d.lines) && d.lines > 0) {
       maxLines = clampLines(d.lines);
       maxLinesEl.value = maxLines;

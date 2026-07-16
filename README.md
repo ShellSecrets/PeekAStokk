@@ -47,7 +47,8 @@ go install github.com/shellsecrets/peekastokk@latest
   UI opens; the others cost nothing (no bandwidth, no browser memory — the
   stream itself is filtered server-side per client) until selected, which
   loads their recent lines straight from disk and joins their live stream.
-  Deselecting a file purges it from browser memory again.
+  Deselecting a file purges it from browser memory again. The selection is
+  remembered per browser and restored on reload.
 - **Filtering** — substring filter with match highlighting (`/` to focus,
   `Esc` to clear); error/warning lines are tinted automatically.
 - **Pause, clear, follow** — the view sticks to the bottom until you scroll
