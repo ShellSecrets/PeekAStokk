@@ -58,8 +58,11 @@ func run() error {
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(),
-			"Usage: peekastokk [flags] [logfile ...]\n\n"+
+			"Usage: peekastokk [flags] [logfile|directory|glob ...]\n\n"+
 				"Tails the given log files and streams them live to a web UI.\n"+
+				"A directory means every file directly inside it; glob patterns\n"+
+				"(e.g. '/var/log/*.log', quoted so the shell passes them through)\n"+
+				"expand at startup.\n"+
 				"Files and flag defaults may also come from a config file, searched at:\n\n\t%s\n\nFlags:\n",
 			strings.Join(config.DefaultPaths(), "\n\t"))
 		flag.PrintDefaults()
@@ -261,28 +264,93 @@ func portInUse(addr string) string {
 	return ""
 }
 
-// resolvePaths validates the file arguments and drops duplicates (same file
-// given twice), while preserving the paths as the user wrote them for
-// display in the UI.
+// maxTailedFiles caps how many files one invocation may tail, so a glob or
+// directory that explodes (node_modules, /var/log on a busy box) fails
+// loudly instead of spawning thousands of tailers.
+const maxTailedFiles = 1000
+
+// resolvePaths expands each argument (plain file, directory, or glob
+// pattern) into concrete file paths and drops duplicates, preserving the
+// paths as expansion produced them.
 func resolvePaths(args []string) ([]string, error) {
 	if len(args) == 0 {
-		return nil, errors.New(`at least one log file is required (as arguments or "file =" entries in a config file)`)
+		return nil, errors.New(`at least one log file, directory, or glob pattern is required (as arguments or "file =" entries in a config file)`)
 	}
 	seen := make(map[string]bool, len(args))
-	paths := make([]string, 0, len(args))
+	var paths []string
 	for _, arg := range args {
-		abs, err := filepath.Abs(arg)
+		expanded, err := expandArg(arg)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range expanded {
+			abs, err := filepath.Abs(p)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", p, err)
+			}
+			if seen[abs] {
+				continue
+			}
+			seen[abs] = true
+			paths = append(paths, p)
+		}
+	}
+	if len(paths) > maxTailedFiles {
+		return nil, fmt.Errorf("arguments expand to %d files, more than the maximum of %d", len(paths), maxTailedFiles)
+	}
+	return paths, nil
+}
+
+// expandArg turns one CLI/config entry into concrete file paths:
+//
+//   - a directory expands to the regular files directly inside it
+//     (dot-files and subdirectories are skipped, non-recursively)
+//   - a glob pattern (*, ?, [) expands to its matching regular files
+//   - a plain path is kept as-is, even if it does not exist yet, so it can
+//     be tailed once created
+//
+// Expansion happens once at startup; files created later only appear via a
+// plain path, not via patterns. A pattern or directory that yields no files
+// is an error rather than a silently empty viewer.
+func expandArg(arg string) ([]string, error) {
+	if strings.ContainsAny(arg, "*?[") {
+		matches, err := filepath.Glob(arg)
+		if err != nil {
+			return nil, fmt.Errorf("%s: invalid pattern: %w", arg, err)
+		}
+		var files []string
+		for _, m := range matches {
+			if info, err := os.Stat(m); err == nil && info.Mode().IsRegular() {
+				files = append(files, m)
+			}
+		}
+		if len(files) == 0 {
+			return nil, fmt.Errorf("%s: no files match the pattern", arg)
+		}
+		return files, nil
+	}
+
+	if info, err := os.Stat(arg); err == nil && info.IsDir() {
+		entries, err := os.ReadDir(arg)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", arg, err)
 		}
-		if seen[abs] {
-			continue
+		var files []string
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
+			p := filepath.Join(arg, e.Name())
+			// Stat (not e.Type) so symlinks to regular files count too.
+			if info, err := os.Stat(p); err == nil && info.Mode().IsRegular() {
+				files = append(files, p)
+			}
 		}
-		seen[abs] = true
-		if info, err := os.Stat(arg); err == nil && info.IsDir() {
-			return nil, fmt.Errorf("%s: is a directory", arg)
+		if len(files) == 0 {
+			return nil, fmt.Errorf("%s: directory contains no files", arg)
 		}
-		paths = append(paths, arg)
+		return files, nil
 	}
-	return paths, nil
+
+	return []string{arg}, nil
 }

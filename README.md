@@ -11,8 +11,16 @@ Written in Go with **zero external dependencies** (standard library only).
 ```sh
 go build -o peekastokk .
 ./peekastokk /var/log/app.log /var/log/nginx/access.log
+./peekastokk /var/log/myapp/            # a directory: every file inside it
+./peekastokk '/var/log/*.log'           # glob patterns (quote them so the
+./peekastokk '/var/log/myproject*'      #  shell passes them through)
 # open http://127.0.0.1:8844/
 ```
+
+Directories expand to the files directly inside them (dot-files and
+subdirectories are skipped); glob patterns expand at startup. A plain path
+that doesn't exist yet is waited for, but an unmatched pattern or empty
+directory is a startup error.
 
 Or install directly:
 

@@ -38,9 +38,13 @@ max-line-bytes = 262144
 # debug, info, warn, or error.
 log-level = info
 
-# Log files to tail: repeat "file" once per log. A leading ~ expands to
+# Log files to tail: repeat "file" once per entry. A leading ~ expands to
 # your home directory; relative paths resolve against this file's
-# directory. Files that do not exist yet are waited for.
+# directory. Plain files that do not exist yet are waited for.
+# Directories mean every file directly inside them, and glob patterns
+# (*.log, myproject*, ...) expand at startup.
 file = /var/log/system.log
 file = ~/logs/app.log
+#file = ~/logs/myapp/
+#file = /var/log/nginx/*.log
 #file = "/var/log/name with spaces.log"
