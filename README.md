@@ -33,10 +33,11 @@ go install github.com/shellsecrets/peekastokk@latest
   to the first line. Only a small window stays in the browser: the part you
   scrolled past is unloaded, and jumping back to the tail frees it all. The
   server keeps nothing extra in memory — the log file itself is the archive.
-- **Multi-file, loaded lazily** — each file gets a colored badge and a
-  toggle chip. Only the first file is streamed when the UI opens; the
-  others cost nothing (no bandwidth, no browser memory — the stream itself
-  is filtered server-side per client) until their chip is clicked, which
+- **Multi-file, loaded lazily** — files are selected through a searchable
+  dropdown (scales to hundreds of files; the trigger shows the current
+  selection, e.g. `app.log +2`). Only the first file is streamed when the
+  UI opens; the others cost nothing (no bandwidth, no browser memory — the
+  stream itself is filtered server-side per client) until selected, which
   loads their recent lines straight from disk and joins their live stream.
   Deselecting a file purges it from browser memory again.
 - **Filtering** — substring filter with match highlighting (`/` to focus,
