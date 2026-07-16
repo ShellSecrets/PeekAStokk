@@ -274,7 +274,9 @@ function clampLines(n) {
   return Math.min(LINES_MAX, Math.max(LINES_MIN, n));
 }
 
-const files = new Map(); // path -> {path, name, color, count, enabled, chipEl, countEl}
+// Files are known only by an opaque server-assigned id and a display name;
+// absolute paths never reach the browser.
+const files = new Map(); // id -> {id, name, color, count, enabled, itemEl, countEl}
 let events = [];
 let lastSeq = 0;
 let filter = "";
@@ -300,41 +302,40 @@ const olderDone = new Set();   // files whose beginning has been reached
 const floors = new Map(); // file -> ignore live events below this offset
 let es = null;
 
-function ensureFile(path) {
-  let f = files.get(path);
+function ensureFile(id, name) {
+  let f = files.get(id);
   if (f) return f;
-  const parts = path.split("/");
   f = {
-    path,
-    name: parts[parts.length - 1] || path,
+    id,
+    name: name || "log " + id,
     color: PALETTE[files.size % PALETTE.length],
     count: 0,
-    // Only the first file starts visible; the rest buffer in the
-    // background until their chip is clicked.
+    // Only the first file starts visible; the rest cost nothing until
+    // selected in the dropdown.
     enabled: files.size === 0,
   };
   const item = document.createElement("div");
   item.className = "fileItem" + (f.enabled ? " on" : "");
   item.style.setProperty("--c", f.color);
-  item.title = path;
+  item.title = f.name;
   const check = document.createElement("span");
   check.className = "fcheck";
   check.textContent = "✓";
   const dot = document.createElement("span");
   dot.className = "fdot";
-  const name = document.createElement("span");
-  name.className = "fname";
-  name.textContent = f.name;
+  const nameEl = document.createElement("span");
+  nameEl.className = "fname";
+  nameEl.textContent = f.name;
   const count = document.createElement("span");
   count.className = "fcount";
   count.textContent = "–";
-  item.append(check, dot, name, count);
+  item.append(check, dot, nameEl, count);
   item.addEventListener("click", () => { toggleFile(f); });
   item.addEventListener("mouseenter", () => { setActive(f); });
   fileListEl.appendChild(item);
   f.itemEl = item;
   f.countEl = count;
-  files.set(path, f);
+  files.set(id, f);
   updateFileButton();
   return f;
 }
@@ -351,7 +352,7 @@ function updateFileButton() {
   fileBtnDot.style.setProperty("--c", selected[0].color);
   fileBtnLabel.textContent =
     selected[0].name + (selected.length > 1 ? `  +${selected.length - 1}` : "");
-  fileBtn.title = selected.map((f) => f.path).join("\n");
+  fileBtn.title = selected.map((f) => f.name).join("\n");
 }
 
 // Keyboard navigation: one row carries the highlight; arrows move it,
@@ -383,7 +384,7 @@ function filterFileList() {
   const q = fileSearch.value.trim().toLowerCase();
   let visible = 0;
   for (const f of files.values()) {
-    const hit = !q || f.name.toLowerCase().includes(q) || f.path.toLowerCase().includes(q);
+    const hit = !q || f.name.toLowerCase().includes(q);
     f.itemEl.hidden = !hit;
     if (hit) visible++;
   }
@@ -454,7 +455,7 @@ function buildLine(ev) {
   badge.className = "badge";
   badge.style.setProperty("--c", f.color);
   badge.textContent = f.name;
-  badge.title = f.path;
+  badge.title = f.name;
   const txt = document.createElement("span");
   txt.className = "txt";
   appendHighlighted(txt, ev.text);
@@ -530,31 +531,31 @@ function divider(text, gap) {
 
 // anchorFor returns the byte offset of the oldest line the UI holds for a
 // file: the lowest backfilled offset, else the first live line seen.
-function anchorFor(path) {
-  if (olderLowest.has(path)) return olderLowest.get(path);
-  return liveOldest.get(path); // may be undefined: server then anchors at EOF
+function anchorFor(id) {
+  if (olderLowest.has(id)) return olderLowest.get(id);
+  return liveOldest.get(id); // may be undefined: server then anchors at EOF
 }
 
 async function loadOlder() {
   if (loadingOlder) return;
-  const targets = [...files.values()].filter((f) => f.enabled && !olderDone.has(f.path));
+  const targets = [...files.values()].filter((f) => f.enabled && !olderDone.has(f.id));
   if (!targets.length) return;
   loadingOlder = true;
   try {
     const runs = [];
     for (const f of targets) {
-      const q = new URLSearchParams({ file: f.path, limit: String(OLDER_PAGE) });
-      const anchor = anchorFor(f.path);
+      const q = new URLSearchParams({ file: f.id, limit: String(OLDER_PAGE) });
+      const anchor = anchorFor(f.id);
       if (anchor !== undefined) q.set("offset", String(anchor));
       let d;
       try {
         const r = await fetch("/api/before?" + q.toString());
-        if (!r.ok) { olderDone.add(f.path); continue; }
+        if (!r.ok) { olderDone.add(f.id); continue; }
         d = await r.json();
-      } catch { olderDone.add(f.path); continue; }
-      if (d.atStart) olderDone.add(f.path);
-      if (!Array.isArray(d.lines) || d.lines.length === 0) { olderDone.add(f.path); continue; }
-      olderLowest.set(f.path, d.lines[0].off);
+      } catch { olderDone.add(f.id); continue; }
+      if (d.atStart) olderDone.add(f.id);
+      if (!Array.isArray(d.lines) || d.lines.length === 0) { olderDone.add(f.id); continue; }
+      olderLowest.set(f.id, d.lines[0].off);
       runs.push({ f, lines: d.lines, atStart: !!d.atStart });
     }
     if (runs.length) prependOlder(runs);
@@ -570,7 +571,7 @@ function prependOlder(runs) {
       (run.atStart ? "start of " : "older · ") + run.f.name, false));
     let shown = 0;
     for (const ln of run.lines) {
-      const ev = { file: run.f.path, text: ln.text, off: ln.off, time: null };
+      const ev = { file: run.f.id, text: ln.text, off: ln.off, time: null };
       if (!matches(ev)) continue;
       frag.appendChild(buildLine(ev));
       shown++;
@@ -614,7 +615,7 @@ function connect() {
     return;
   }
   const q = new URLSearchParams();
-  for (const f of selected) q.append("files", f.path);
+  for (const f of selected) q.append("files", f.id);
   if (lastSeq > 0) q.set("after", String(lastSeq));
   const qs = q.toString();
   es = new EventSource("/events" + (qs ? "?" + qs : ""));
@@ -652,9 +653,9 @@ async function toggleFile(f) {
   updateFileButton();
 
   if (!f.enabled) {
-    events = events.filter((e) => e.file !== f.path);
-    liveOldest.delete(f.path);
-    floors.delete(f.path);
+    events = events.filter((e) => e.file !== f.id);
+    liveOldest.delete(f.id);
+    floors.delete(f.id);
     f.count = 0;
     rerender();
     connect();
@@ -663,15 +664,15 @@ async function toggleFile(f) {
 
   rerender();
   try {
-    const q = new URLSearchParams({ file: f.path, limit: String(maxLines) });
+    const q = new URLSearchParams({ file: f.id, limit: String(maxLines) });
     const d = await (await fetch("/api/before?" + q.toString())).json();
     if (Array.isArray(d.lines) && d.lines.length) {
       const last = d.lines[d.lines.length - 1];
-      floors.set(f.path, last.off + last.text.length + 1);
-      liveOldest.set(f.path, d.lines[0].off);
-      if (d.atStart) olderDone.add(f.path);
+      floors.set(f.id, last.off + last.text.length + 1);
+      liveOldest.set(f.id, d.lines[0].off);
+      if (d.atStart) olderDone.add(f.id);
       const loaded = d.lines.map((ln) => ({
-        seq: 0, file: f.path, text: ln.text, off: ln.off, time: null,
+        seq: 0, file: f.id, text: ln.text, off: ln.off, time: null,
       }));
       events = loaded.concat(events);
       if (events.length > MAX_STORE) events.splice(0, events.length - MAX_STORE);
@@ -786,7 +787,7 @@ document.addEventListener("keydown", (e) => {
 async function init() {
   try {
     const d = await (await fetch("/api/files")).json();
-    (d.files || []).forEach(ensureFile);
+    (d.files || []).forEach((entry) => ensureFile(entry.id, entry.name));
     if (localStorage.getItem(LINES_KEY) === null && Number.isInteger(d.lines) && d.lines > 0) {
       maxLines = clampLines(d.lines);
       maxLinesEl.value = maxLines;

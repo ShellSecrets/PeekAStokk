@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -69,13 +71,16 @@ func TestFilesEndpoint(t *testing.T) {
 	defer resp.Body.Close()
 
 	var body struct {
-		Files []string `json:"files"`
-		Lines int      `json:"lines"`
+		Files []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"files"`
+		Lines int `json:"lines"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body.Files) != 2 || body.Files[0] != "a.log" {
+	if len(body.Files) != 2 || body.Files[0].ID != "0" || body.Files[0].Name != "a.log" {
 		t.Fatalf("files = %v", body.Files)
 	}
 	if body.Lines != 500 {
@@ -165,7 +170,7 @@ func TestEventStreamFilesFilter(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/events?files=b.log", nil)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/events?files=1", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -217,6 +222,49 @@ func TestEventStreamRejectsBadFilesFilter(t *testing.T) {
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("%s: status = %d, want 400", q, resp.StatusCode)
+		}
+	}
+}
+
+// TestNoPathDisclosure locks in the privacy contract: absolute paths of
+// tailed files must never appear in anything sent to a client.
+func TestNoPathDisclosure(t *testing.T) {
+	dir := t.TempDir() // a distinctive absolute path
+	path := filepath.Join(dir, "app.log")
+	if err := os.WriteFile(path, []byte("on disk\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := hub.New(10)
+	h.Publish(path, "streamed line", 0, time.Now())
+	ts := httptest.NewServer(server.New(h, []string{path}, 500, nil).Handler())
+	t.Cleanup(ts.Close)
+
+	fetch := func(url string) string {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		buf := make([]byte, 64*1024)
+		n, _ := resp.Body.Read(buf)
+		return string(buf[:n])
+	}
+
+	for name, url := range map[string]string{
+		"api/files":  ts.URL + "/api/files",
+		"events":     ts.URL + "/events",
+		"api/before": ts.URL + "/api/before?file=0",
+	} {
+		body := fetch(url)
+		if strings.Contains(body, dir) {
+			t.Errorf("%s response leaks the file path:\n%s", name, body)
+		}
+		if body == "" {
+			t.Errorf("%s returned an empty body", name)
 		}
 	}
 }

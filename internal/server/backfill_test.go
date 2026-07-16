@@ -57,11 +57,11 @@ func getBefore(t *testing.T, ts *httptest.Server, params url.Values) (int, befor
 }
 
 func TestBackfillPagesBackwardsFromAnchor(t *testing.T) {
-	ts, path := newBackfillServer(t)
+	ts, _ := newBackfillServer(t)
 
 	// Anchor at line-5 (offset 35): the 3 lines before it are 2, 3, 4.
 	status, body := getBefore(t, ts, url.Values{
-		"file": {path}, "offset": {"35"}, "limit": {"3"},
+		"file": {"0"}, "offset": {"35"}, "limit": {"3"},
 	})
 	if status != http.StatusOK {
 		t.Fatalf("status = %d", status)
@@ -80,7 +80,7 @@ func TestBackfillPagesBackwardsFromAnchor(t *testing.T) {
 
 	// Page again from the new oldest offset: reaches the file start.
 	status, body = getBefore(t, ts, url.Values{
-		"file": {path}, "offset": {"14"}, "limit": {"5"},
+		"file": {"0"}, "offset": {"14"}, "limit": {"5"},
 	})
 	if status != http.StatusOK || len(body.Lines) != 2 || !body.AtStart {
 		t.Fatalf("second page = %d %+v", status, body)
@@ -91,8 +91,8 @@ func TestBackfillPagesBackwardsFromAnchor(t *testing.T) {
 }
 
 func TestBackfillWithoutOffsetAnchorsAtEOF(t *testing.T) {
-	ts, path := newBackfillServer(t)
-	status, body := getBefore(t, ts, url.Values{"file": {path}})
+	ts, _ := newBackfillServer(t)
+	status, body := getBefore(t, ts, url.Values{"file": {"0"}})
 	if status != http.StatusOK || len(body.Lines) != 10 || !body.AtStart {
 		t.Fatalf("got %d, %d lines, atStart=%v", status, len(body.Lines), body.AtStart)
 	}
@@ -102,8 +102,8 @@ func TestBackfillWithoutOffsetAnchorsAtEOF(t *testing.T) {
 }
 
 func TestBackfillAtOffsetZeroIsEmptyAndAtStart(t *testing.T) {
-	ts, path := newBackfillServer(t)
-	status, body := getBefore(t, ts, url.Values{"file": {path}, "offset": {"0"}})
+	ts, _ := newBackfillServer(t)
+	status, body := getBefore(t, ts, url.Values{"file": {"0"}, "offset": {"0"}})
 	if status != http.StatusOK || len(body.Lines) != 0 || !body.AtStart {
 		t.Fatalf("got %d %+v", status, body)
 	}
@@ -117,7 +117,7 @@ func TestBackfillDropsUnterminatedTrailingLine(t *testing.T) {
 	ts := httptest.NewServer(server.New(hub.New(10), []string{path}, 500, nil).Handler())
 	t.Cleanup(ts.Close)
 
-	status, body := getBefore(t, ts, url.Values{"file": {path}})
+	status, body := getBefore(t, ts, url.Values{"file": {"0"}})
 	if status != http.StatusOK || len(body.Lines) != 1 || body.Lines[0].Text != "done" {
 		t.Fatalf("got %d %+v", status, body)
 	}
@@ -143,19 +143,19 @@ func TestBackfillOnMissingTailedFileIsEmptyAtStart(t *testing.T) {
 	ts := httptest.NewServer(server.New(hub.New(10), []string{path}, 500, nil).Handler())
 	t.Cleanup(ts.Close)
 
-	status, body := getBefore(t, ts, url.Values{"file": {path}})
+	status, body := getBefore(t, ts, url.Values{"file": {"0"}})
 	if status != http.StatusOK || len(body.Lines) != 0 || !body.AtStart {
 		t.Fatalf("got %d %+v", status, body)
 	}
 }
 
 func TestBackfillRejectsBadParams(t *testing.T) {
-	ts, path := newBackfillServer(t)
+	ts, _ := newBackfillServer(t)
 	for _, params := range []url.Values{
-		{"file": {path}, "offset": {"abc"}},
-		{"file": {path}, "limit": {"0"}},
-		{"file": {path}, "limit": {"-2"}},
-		{"file": {path}, "limit": {"x"}},
+		{"file": {"0"}, "offset": {"abc"}},
+		{"file": {"0"}, "limit": {"0"}},
+		{"file": {"0"}, "limit": {"-2"}},
+		{"file": {"0"}, "limit": {"x"}},
 	} {
 		if status, _ := getBefore(t, ts, params); status != http.StatusBadRequest {
 			t.Errorf("params %v: status = %d, want 400", params, status)

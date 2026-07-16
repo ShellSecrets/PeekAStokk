@@ -39,13 +39,14 @@ type backfillResponse struct {
 
 // handleBefore returns up to limit complete lines that end strictly before
 // byte offset "offset" in the given file, oldest first. Omitting offset (or
-// passing a negative one) anchors at the end of the file. Only files this
-// server is tailing may be read.
+// passing a negative one) anchors at the end of the file. The file is named
+// by its opaque id; only files this server is tailing may be read.
 func (s *Server) handleBefore(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
 	file := q.Get("file")
-	if !s.fileSet[file] {
+	path, known := s.pathByID[file]
+	if !known {
 		http.Error(w, "unknown file", http.StatusNotFound)
 		return
 	}
@@ -70,14 +71,14 @@ func (s *Server) handleBefore(w http.ResponseWriter, r *http.Request) {
 		limit = min(n, maxBackfillLines)
 	}
 
-	lines, atStart, err := readLinesBefore(file, before, limit)
+	lines, atStart, err := readLinesBefore(path, before, limit)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			// Tailed but not created yet: nothing before, by definition.
 			writeJSON(w, backfillResponse{File: file, Lines: []backfillLine{}, AtStart: true})
 			return
 		}
-		s.log.Warn("backfill failed", "file", file, "error", err)
+		s.log.Warn("backfill failed", "file", path, "error", err)
 		http.Error(w, "read failed", http.StatusInternalServerError)
 		return
 	}

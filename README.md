@@ -123,6 +123,12 @@ PeekAStokk serves whatever it tails, without authentication. It binds to
 `127.0.0.1` by default; if you expose it on another interface with `-addr`,
 put it behind a reverse proxy that handles auth/TLS.
 
+Absolute file paths never leave the server: clients (and anything
+inspecting the traffic) only ever see opaque file ids and base names
+(`app.log`, deduplicated as `app.log #2`), in API responses, the SSE
+stream, and query parameters alike — so the host's directory layout is
+not disclosed.
+
 ## Architecture
 
 ```

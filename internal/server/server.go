@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -32,19 +33,29 @@ const (
 	heartbeatInterval = 15 * time.Second
 )
 
+// fileEntry is all the UI ever sees of a tailed file: an opaque id and a
+// display name (the base name, deduplicated). The absolute path never
+// leaves the server, so browsers — and anyone watching the wire — learn
+// nothing about the host's directory layout.
+type fileEntry struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
 // Server serves the embedded UI, the event stream, and small JSON APIs.
 type Server struct {
-	hub     *hub.Hub
-	files   []string
-	fileSet map[string]bool // exact tailed paths /api/before may read
-	lines   int
-	log     *slog.Logger
-	mux     *http.ServeMux
+	hub      *hub.Hub
+	entries  []fileEntry
+	pathByID map[string]string // opaque id -> tailed path (server-side only)
+	idByPath map[string]string
+	lines    int
+	log      *slog.Logger
+	mux      *http.ServeMux
 }
 
 // New builds a Server streaming from h; files is the list of tailed paths
-// shown in the UI and lines is the default number of lines the UI keeps on
-// screen (the user can change it there).
+// and lines is the default number of lines the UI keeps on screen (the
+// user can change it there).
 func New(h *hub.Hub, files []string, lines int, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
@@ -52,11 +63,22 @@ func New(h *hub.Hub, files []string, lines int, logger *slog.Logger) *Server {
 	if lines <= 0 {
 		lines = 500
 	}
-	fileSet := make(map[string]bool, len(files))
-	for _, f := range files {
-		fileSet[f] = true
+	names := displayNames(files)
+	s := &Server{
+		hub:      h,
+		entries:  make([]fileEntry, len(files)),
+		pathByID: make(map[string]string, len(files)),
+		idByPath: make(map[string]string, len(files)),
+		lines:    lines,
+		log:      logger,
+		mux:      http.NewServeMux(),
 	}
-	s := &Server{hub: h, files: files, fileSet: fileSet, lines: lines, log: logger, mux: http.NewServeMux()}
+	for i, path := range files {
+		id := strconv.Itoa(i)
+		s.entries[i] = fileEntry{ID: id, Name: names[i]}
+		s.pathByID[id] = path
+		s.idByPath[path] = id
+	}
 	s.mux.HandleFunc("GET /{$}", s.handleIndex)
 	s.mux.HandleFunc("GET /events", s.handleEvents)
 	s.mux.HandleFunc("GET /api/files", s.handleFiles)
@@ -75,7 +97,29 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]any{"files": s.files, "lines": s.lines})
+	writeJSON(w, map[string]any{"files": s.entries, "lines": s.lines})
+}
+
+// displayNames maps paths to their base names, numbering duplicates
+// ("app.log #2") so two files from different directories stay
+// distinguishable without revealing those directories.
+func displayNames(paths []string) []string {
+	total := make(map[string]int, len(paths))
+	for _, p := range paths {
+		total[filepath.Base(p)]++
+	}
+	seen := make(map[string]int, len(paths))
+	names := make([]string, len(paths))
+	for i, p := range paths {
+		base := filepath.Base(p)
+		if total[base] > 1 {
+			seen[base]++
+			names[i] = fmt.Sprintf("%s #%d", base, seen[base])
+		} else {
+			names[i] = base
+		}
+	}
+	return names
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -107,20 +151,21 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// An optional files filter (repeated ?files= values) restricts the
-	// stream to selected files, so unselected files cost the client
-	// nothing. Absent means every file.
+	// An optional files filter (repeated ?files= values, opaque ids)
+	// restricts the stream to selected files, so unselected files cost
+	// the client nothing. Absent means every file.
 	var fileFilter []string
 	if vals, ok := r.URL.Query()["files"]; ok {
 		for _, v := range vals {
 			if v == "" {
 				continue
 			}
-			if !s.fileSet[v] {
+			path, known := s.pathByID[v]
+			if !known {
 				http.Error(w, "unknown file in files filter", http.StatusBadRequest)
 				return
 			}
-			fileFilter = append(fileFilter, v)
+			fileFilter = append(fileFilter, path)
 		}
 		if len(fileFilter) == 0 {
 			http.Error(w, "files filter is empty", http.StatusBadRequest)
@@ -141,7 +186,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	defer s.log.Debug("sse client disconnected", "remote", r.RemoteAddr)
 
 	for _, ev := range history {
-		if writeEvent(w, ev) != nil {
+		if s.writeEvent(w, ev) != nil {
 			return
 		}
 	}
@@ -155,7 +200,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case ev, open := <-sub.Events():
-			if !open || !writeBatch(w, flusher, sub, ev) {
+			if !open || !s.writeBatch(w, flusher, sub, ev) {
 				return
 			}
 		case <-heartbeat.C:
@@ -171,14 +216,14 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 // writeBatch writes first plus any events already queued (up to batchLimit)
 // and flushes once. It reports whether streaming should continue.
-func writeBatch(w io.Writer, flusher http.Flusher, sub *hub.Subscriber, first hub.Event) bool {
-	if writeEvent(w, first) != nil {
+func (s *Server) writeBatch(w io.Writer, flusher http.Flusher, sub *hub.Subscriber, first hub.Event) bool {
+	if s.writeEvent(w, first) != nil {
 		return false
 	}
 	for i := 0; i < batchLimit; i++ {
 		select {
 		case ev, open := <-sub.Events():
-			if !open || writeEvent(w, ev) != nil {
+			if !open || s.writeEvent(w, ev) != nil {
 				flusher.Flush()
 				return false
 			}
@@ -191,8 +236,17 @@ func writeBatch(w io.Writer, flusher http.Flusher, sub *hub.Subscriber, first hu
 	return true
 }
 
-func writeEvent(w io.Writer, ev hub.Event) error {
-	data, err := json.Marshal(ev)
+// writeEvent serializes ev for the wire, replacing the internal file path
+// with its opaque id.
+func (s *Server) writeEvent(w io.Writer, ev hub.Event) error {
+	wire := struct {
+		Seq  uint64    `json:"seq"`
+		File string    `json:"file"` // opaque id, never the path
+		Text string    `json:"text"`
+		Off  int64     `json:"off"`
+		Time time.Time `json:"time"`
+	}{ev.Seq, s.idByPath[ev.File], ev.Text, ev.Off, ev.Time}
+	data, err := json.Marshal(wire)
 	if err != nil {
 		return err
 	}
