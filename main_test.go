@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// quiet swallows the duplicate-info logs during tests.
+var quiet = slog.New(slog.DiscardHandler)
 
 func write(t *testing.T, path string) {
 	t.Helper()
@@ -32,7 +37,7 @@ func TestResolvePathsExpandsDirectory(t *testing.T) {
 	write(t, filepath.Join(dir, ".hidden"))
 	write(t, filepath.Join(dir, "sub", "nested.log")) // subdir itself must be skipped
 
-	paths, err := resolvePaths([]string{dir})
+	paths, err := resolvePaths([]string{dir}, quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +55,7 @@ func TestResolvePathsExpandsGlobs(t *testing.T) {
 	write(t, filepath.Join(dir, "myproject-a.out"))
 	write(t, filepath.Join(dir, "myproject-b.out"))
 
-	paths, err := resolvePaths([]string{filepath.Join(dir, "*.log")})
+	paths, err := resolvePaths([]string{filepath.Join(dir, "*.log")}, quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +63,7 @@ func TestResolvePathsExpandsGlobs(t *testing.T) {
 		t.Fatalf("*.log -> %v", got)
 	}
 
-	paths, err = resolvePaths([]string{filepath.Join(dir, "myproject*")})
+	paths, err = resolvePaths([]string{filepath.Join(dir, "myproject*")}, quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +79,7 @@ func TestResolvePathsGlobSkipsDirectories(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	paths, err := resolvePaths([]string{filepath.Join(dir, "*")})
+	paths, err := resolvePaths([]string{filepath.Join(dir, "*")}, quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +99,7 @@ func TestResolvePathsErrors(t *testing.T) {
 		"empty directory":   {empty},
 		"no args":           {},
 	} {
-		if _, err := resolvePaths(args); err == nil {
+		if _, err := resolvePaths(args, quiet); err == nil {
 			t.Errorf("%s: expected error", name)
 		}
 	}
@@ -109,7 +114,7 @@ func TestResolvePathsKeepsMissingPlainPathAndDedupes(t *testing.T) {
 		filepath.Join(dir, "future.log"),
 		dir,
 		filepath.Join(dir, "a.log"),
-	})
+	}, quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,13 +124,69 @@ func TestResolvePathsKeepsMissingPlainPathAndDedupes(t *testing.T) {
 	}
 }
 
+func TestResolvePathsLogsDuplicates(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "a.log"))
+	write(t, filepath.Join(dir, "b.log"))
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	// a.log arrives via the directory, explicitly, and through a glob; the
+	// glob adds nothing new at all.
+	paths, err := resolvePaths([]string{
+		dir,
+		filepath.Join(dir, "a.log"),
+		filepath.Join(dir, "*.log"),
+	}, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("paths = %v", paths)
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "skipping duplicate log file") {
+		t.Errorf("duplicate files were not logged:\n%s", logs)
+	}
+	if !strings.Contains(logs, "argument only named files that are already tailed") {
+		t.Errorf("fully-duplicate argument was not logged:\n%s", logs)
+	}
+	if strings.Count(logs, "skipping duplicate log file") != 3 {
+		t.Errorf("want 3 duplicate lines (a.log explicit + a.log,b.log via glob), got:\n%s", logs)
+	}
+}
+
+func TestResolvePathsDedupesSymlinkAliases(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real.log")
+	write(t, target)
+	link := filepath.Join(dir, "alias.log")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	paths, err := resolvePaths([]string{target, link}, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 || paths[0] != target {
+		t.Fatalf("paths = %v, want just the target", paths)
+	}
+	if !strings.Contains(buf.String(), "already_tailed_as") {
+		t.Errorf("symlink duplicate not logged with its target:\n%s", buf.String())
+	}
+}
+
 func TestResolvePathsCapsFileCount(t *testing.T) {
 	dir := t.TempDir()
 	args := make([]string, maxTailedFiles+1)
 	for i := range args {
 		args[i] = filepath.Join(dir, "missing-", strings.Repeat("x", 3), "-", string(rune('a'+i%26)), "-", filepath.Base(t.TempDir()))
 	}
-	if _, err := resolvePaths(args); err == nil || !strings.Contains(err.Error(), "maximum") {
+	if _, err := resolvePaths(args, quiet); err == nil || !strings.Contains(err.Error(), "maximum") {
 		t.Fatalf("expected cap error, got %v", err)
 	}
 }

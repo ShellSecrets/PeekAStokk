@@ -118,20 +118,6 @@ func run() error {
 		}
 	}
 
-	// Files on the command line replace the config file's list entirely.
-	args := flag.Args()
-	if len(args) == 0 && cfg != nil {
-		args = cfg.Files
-	}
-	paths, err := resolvePaths(args)
-	if err != nil {
-		flag.Usage()
-		return err
-	}
-	if *uiLines <= 0 {
-		return fmt.Errorf("-lines must be positive, got %d", *uiLines)
-	}
-
 	var level slog.Level
 	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {
 		return fmt.Errorf("invalid -log-level %q", *logLevel)
@@ -140,6 +126,20 @@ func run() error {
 	slog.SetDefault(logger)
 	if cfg != nil {
 		logger.Info("loaded config", "path", cfg.Path)
+	}
+
+	// Files on the command line replace the config file's list entirely.
+	args := flag.Args()
+	if len(args) == 0 && cfg != nil {
+		args = cfg.Files
+	}
+	paths, err := resolvePaths(args, logger)
+	if err != nil {
+		flag.Usage()
+		return err
+	}
+	if *uiLines <= 0 {
+		return fmt.Errorf("-lines must be positive, got %d", *uiLines)
 	}
 
 	// Claim the port before starting anything, so a taken port is a clean
@@ -271,34 +271,64 @@ const maxTailedFiles = 1000
 
 // resolvePaths expands each argument (plain file, directory, or glob
 // pattern) into concrete file paths and drops duplicates, preserving the
-// paths as expansion produced them.
-func resolvePaths(args []string) ([]string, error) {
+// paths as expansion produced them. Every dropped duplicate is logged at
+// info level so overlapping arguments (the same file via a directory and
+// explicitly, overlapping globs, symlink aliases) are visible rather than
+// silent.
+func resolvePaths(args []string, logger *slog.Logger) ([]string, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if len(args) == 0 {
 		return nil, errors.New(`at least one log file, directory, or glob pattern is required (as arguments or "file =" entries in a config file)`)
 	}
-	seen := make(map[string]bool, len(args))
+	seen := make(map[string]string, len(args)) // identity -> path as first added
 	var paths []string
 	for _, arg := range args {
 		expanded, err := expandArg(arg)
 		if err != nil {
 			return nil, err
 		}
+		added := 0
 		for _, p := range expanded {
-			abs, err := filepath.Abs(p)
+			id, err := pathIdentity(p)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", p, err)
 			}
-			if seen[abs] {
+			if first, dup := seen[id]; dup {
+				if first == p {
+					logger.Info("skipping duplicate log file", "file", p)
+				} else {
+					logger.Info("skipping duplicate log file", "file", p, "already_tailed_as", first)
+				}
 				continue
 			}
-			seen[abs] = true
+			seen[id] = p
 			paths = append(paths, p)
+			added++
+		}
+		if added == 0 && len(expanded) > 1 {
+			logger.Info("argument only named files that are already tailed", "arg", arg)
 		}
 	}
 	if len(paths) > maxTailedFiles {
 		return nil, fmt.Errorf("arguments expand to %d files, more than the maximum of %d", len(paths), maxTailedFiles)
 	}
 	return paths, nil
+}
+
+// pathIdentity returns a canonical form of p for duplicate detection:
+// absolute, with symlinks resolved when the file exists, so a symlink and
+// its target are recognized as the same log.
+func pathIdentity(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved, nil
+	}
+	return abs, nil // not created yet: the literal path is its identity
 }
 
 // expandArg turns one CLI/config entry into concrete file paths:
