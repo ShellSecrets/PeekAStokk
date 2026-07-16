@@ -1,0 +1,7 @@
+# Build artifacts
+/peekastokk
+/dist/
+
+# Test & coverage output
+*.out
+*.test

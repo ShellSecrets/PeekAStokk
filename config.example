@@ -1,0 +1,46 @@
+# PeekAStokk example configuration.
+#
+# Copy to one of (searched in this order, first match wins):
+#   $XDG_CONFIG_HOME/peekastokk/config   (~/.config/peekastokk/config)
+#   ~/.peekastokk
+#   ~/.peekastokk/config
+# or point at it explicitly with:  peekastokk -config /path/to/config
+#
+# Every key is optional; command-line flags override anything set here.
+# Lines starting with # or ; are comments, as is an unquoted trailing
+# "  # comment". Quote a value to keep a literal # or surrounding spaces.
+
+# Port to listen on (keeps the default host, 127.0.0.1).
+port = 8844
+
+# ...or set the full listen address instead of "port" (never both).
+# Anything other than 127.0.0.1 exposes your logs to the network — read the
+# "Security note" in the README first.
+#addr = 0.0.0.0:8844
+
+# Recent lines replayed to newly connected browsers.
+history = 2000
+
+# Default number of lines the web UI keeps on screen.
+# Adjustable live in the UI; a value chosen there sticks (per browser).
+lines = 500
+
+# How often tailed files are checked for new data.
+poll = 200ms
+
+# Max bytes of existing content replayed per file at startup.
+# Negative starts at the end of the file (no replay).
+tail-bytes = 65536
+
+# Lines longer than this are split into chunks.
+max-line-bytes = 262144
+
+# debug, info, warn, or error.
+log-level = info
+
+# Log files to tail: repeat "file" once per log. A leading ~ expands to
+# your home directory; relative paths resolve against this file's
+# directory. Files that do not exist yet are waited for.
+file = /var/log/system.log
+file = ~/logs/app.log
+#file = "/var/log/name with spaces.log"

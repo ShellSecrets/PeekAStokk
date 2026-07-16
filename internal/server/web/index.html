@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PeekAStokk</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>👀</text></svg>">
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --fg: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --err: #ff7b72;
+    --warn: #d29922;
+    --ok: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem .75rem;
+    align-items: center;
+    padding: .55rem .9rem;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: .5rem; font-weight: 700; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.live { background: var(--ok); }
+  .dot.reconnecting { background: var(--warn); animation: pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  #statusText { color: var(--muted); font-size: 12px; }
+
+  #search {
+    flex: 1 1 200px;
+    min-width: 160px;
+    max-width: 360px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--fg);
+    border-radius: 6px;
+    padding: .35rem .6rem;
+    font-size: 13px;
+    outline: none;
+  }
+  #search:focus { border-color: var(--accent); }
+
+  #chips { display: flex; flex-wrap: wrap; gap: .35rem; }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: .4rem;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--c, var(--accent));
+    color: var(--fg);
+    border-radius: 6px;
+    padding: .22rem .55rem;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .chip:hover { background: rgba(255,255,255,.05); }
+  .chip.off { opacity: .38; }
+  .chip .count { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  .actions { display: flex; align-items: center; gap: .5rem; margin-left: auto; }
+  .actions button {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--fg);
+    border-radius: 6px;
+    padding: .3rem .7rem;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .actions button:hover { background: rgba(255,255,255,.05); }
+  .actions button.active { border-color: var(--warn); color: var(--warn); }
+  #stats { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #linesCtl { display: inline-flex; align-items: center; gap: .35rem; color: var(--muted); font-size: 12px; }
+  #maxLines {
+    width: 4.5rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--fg);
+    border-radius: 6px;
+    padding: .28rem .4rem;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    outline: none;
+  }
+  #maxLines:focus { border-color: var(--accent); }
+
+  #log { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: .35rem 0; }
+  #older:empty + #live:empty::before {
+    content: "Waiting for log lines…";
+    display: block;
+    padding: 2rem .9rem;
+    color: var(--muted);
+    font-style: italic;
+  }
+  #older .line { opacity: .82; }
+  .divider {
+    display: flex;
+    align-items: center;
+    gap: .6rem;
+    color: var(--muted);
+    font-size: 11px;
+    padding: .15rem .9rem;
+    user-select: none;
+  }
+  .divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
+  .divider.gap { color: var(--warn); }
+  .line {
+    display: flex;
+    gap: .6rem;
+    padding: .04rem .9rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+  }
+  .line:hover { background: rgba(255,255,255,.04); }
+  .ts { color: var(--muted); flex: none; }
+  .badge { color: var(--c, var(--accent)); flex: none; font-weight: 600; }
+  .txt { white-space: pre-wrap; word-break: break-word; min-width: 0; }
+  .lvl-error .txt { color: var(--err); }
+  .lvl-warn .txt { color: var(--warn); }
+  mark { background: rgba(88,166,255,.35); color: inherit; border-radius: 2px; }
+
+  #jump {
+    position: fixed;
+    bottom: 1rem;
+    right: 1.25rem;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--fg);
+    border-radius: 999px;
+    padding: .4rem .9rem;
+    font-size: 12px;
+    cursor: pointer;
+    box-shadow: 0 4px 14px rgba(0,0,0,.5);
+  }
+  #jump:hover { border-color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span>PeekAStokk</span>
+    <span id="statusDot" class="dot" title="connection status"></span>
+    <span id="statusText">connecting</span>
+  </div>
+  <input id="search" type="search" placeholder="Filter lines… ( / )" autocomplete="off">
+  <div id="chips"></div>
+  <div class="actions">
+    <label id="linesCtl" title="Number of lines kept on screen">Lines
+      <input id="maxLines" type="number" inputmode="numeric" min="10" max="20000" step="50">
+    </label>
+    <button id="pause" title="Stop appending new lines to the view">Pause</button>
+    <button id="clear" title="Discard buffered lines">Clear</button>
+    <span id="stats"></span>
+  </div>
+</header>
+<main id="log">
+  <div id="older"></div>
+  <div id="live"></div>
+</main>
+<button id="jump" hidden>Jump to latest ↓</button>
+
+<script>
+"use strict";
+
+const logEl = document.getElementById("log");
+const olderEl = document.getElementById("older");
+const liveEl = document.getElementById("live");
+const chipsEl = document.getElementById("chips");
+const statusDot = document.getElementById("statusDot");
+const statusText = document.getElementById("statusText");
+const statsEl = document.getElementById("stats");
+const searchEl = document.getElementById("search");
+const pauseBtn = document.getElementById("pause");
+const clearBtn = document.getElementById("clear");
+const jumpBtn = document.getElementById("jump");
+const maxLinesEl = document.getElementById("maxLines");
+
+const PALETTE = ["#58a6ff", "#3fb950", "#d29922", "#f778ba", "#a371f7", "#ff7b72", "#39c5cf", "#e3b341"];
+const MAX_STORE = 20000; // events kept in memory
+const LINES_MIN = 10, LINES_MAX = 20000, LINES_KEY = "peekastokk.maxLines";
+
+// Lines kept on screen. Priority: value the user set here (localStorage),
+// then the server's configured default, then 500.
+let maxLines = 500;
+const storedLines = parseInt(localStorage.getItem(LINES_KEY), 10);
+if (!Number.isNaN(storedLines)) maxLines = clampLines(storedLines);
+maxLinesEl.value = maxLines;
+
+function clampLines(n) {
+  return Math.min(LINES_MAX, Math.max(LINES_MIN, n));
+}
+
+const files = new Map(); // path -> {path, name, color, count, enabled, chipEl, countEl}
+let events = [];
+let lastSeq = 0;
+let filter = "";
+let paused = false;
+let pendingNodes = [];
+let rafScheduled = false;
+
+// Scrollback: scrolling to the top pages older lines from the file on disk
+// (via /api/before), keeping only a bounded window in the browser. Reaching
+// the bottom again frees it all.
+const OLDER_MAX = 6000;   // older lines kept in the DOM before unloading
+const OLDER_PAGE = 2000;  // lines fetched per request per file
+let olderCount = 0;
+let loadingOlder = false;
+const olderLowest = new Map(); // file -> lowest backfilled offset
+const liveOldest = new Map();  // file -> offset of first live line seen
+const olderDone = new Set();   // files whose beginning has been reached
+
+function ensureFile(path) {
+  let f = files.get(path);
+  if (f) return f;
+  const parts = path.split("/");
+  f = {
+    path,
+    name: parts[parts.length - 1] || path,
+    color: PALETTE[files.size % PALETTE.length],
+    count: 0,
+    // Only the first file starts visible; the rest buffer in the
+    // background until their chip is clicked.
+    enabled: files.size === 0,
+  };
+  const chip = document.createElement("button");
+  chip.className = "chip" + (f.enabled ? "" : " off");
+  chip.style.setProperty("--c", f.color);
+  chip.title = path + (f.enabled ? "" : " — click to show");
+  const label = document.createElement("span");
+  label.textContent = f.name;
+  const count = document.createElement("span");
+  count.className = "count";
+  count.textContent = "0";
+  chip.append(label, count);
+  chip.addEventListener("click", () => {
+    f.enabled = !f.enabled;
+    chip.classList.toggle("off", !f.enabled);
+    rerender();
+  });
+  chipsEl.appendChild(chip);
+  f.chipEl = chip;
+  f.countEl = count;
+  files.set(path, f);
+  return f;
+}
+
+function matches(ev) {
+  const f = files.get(ev.file);
+  if (f && !f.enabled) return false;
+  return !filter || ev.text.toLowerCase().includes(filter);
+}
+
+function levelOf(text) {
+  if (/\b(err(or)?|fatal|panic|exception|crit(ical)?)\b/i.test(text)) return "error";
+  if (/\bwarn(ing)?\b/i.test(text)) return "warn";
+  return "";
+}
+
+function fmtTime(iso) {
+  const d = new Date(iso);
+  const p = (n, w = 2) => String(n).padStart(w, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+}
+
+// Builds the text span, wrapping filter matches in <mark>. Uses DOM APIs
+// only — log content is never injected as HTML.
+function appendHighlighted(el, text) {
+  if (!filter) {
+    el.textContent = text;
+    return;
+  }
+  const lower = text.toLowerCase();
+  let i = 0, idx;
+  while ((idx = lower.indexOf(filter, i)) !== -1) {
+    if (idx > i) el.append(text.slice(i, idx));
+    const m = document.createElement("mark");
+    m.textContent = text.slice(idx, idx + filter.length);
+    el.append(m);
+    i = idx + filter.length;
+  }
+  if (i < text.length) el.append(text.slice(i));
+}
+
+function buildLine(ev) {
+  const f = ensureFile(ev.file);
+  const line = document.createElement("div");
+  const lvl = levelOf(ev.text);
+  line.className = "line" + (lvl ? " lvl-" + lvl : "");
+  const ts = document.createElement("span");
+  ts.className = "ts";
+  ts.textContent = ev.time ? fmtTime(ev.time) : "·";
+  const badge = document.createElement("span");
+  badge.className = "badge";
+  badge.style.setProperty("--c", f.color);
+  badge.textContent = f.name;
+  badge.title = f.path;
+  const txt = document.createElement("span");
+  txt.className = "txt";
+  appendHighlighted(txt, ev.text);
+  line.append(ts, badge, txt);
+  return line;
+}
+
+function nearBottom() {
+  return logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 48;
+}
+
+function scheduleFlush() {
+  if (rafScheduled) return;
+  rafScheduled = true;
+  requestAnimationFrame(() => {
+    rafScheduled = false;
+    if (pendingNodes.length) {
+      const stick = nearBottom();
+      const frag = document.createDocumentFragment();
+      for (const n of pendingNodes) frag.appendChild(n);
+      pendingNodes = [];
+      liveEl.appendChild(frag);
+      while (liveEl.childElementCount > maxLines) liveEl.firstElementChild.remove();
+      if (stick) {
+        clearOlder(); // back at the tail: release the scrollback window
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+    }
+    updateHud();
+  });
+}
+
+function updateHud() {
+  for (const f of files.values()) f.countEl.textContent = f.count.toLocaleString();
+  let stats = `${events.length.toLocaleString()} buffered · ${liveEl.childElementCount.toLocaleString()} shown`;
+  if (olderCount > 0) stats += ` · ${olderCount.toLocaleString()} older`;
+  statsEl.textContent = stats;
+  jumpBtn.hidden = nearBottom();
+}
+
+function rerender() {
+  pendingNodes = [];
+  clearOlder();
+  const picked = [];
+  for (let i = events.length - 1; i >= 0 && picked.length < maxLines; i--) {
+    if (matches(events[i])) picked.push(events[i]);
+  }
+  picked.reverse();
+  const frag = document.createDocumentFragment();
+  for (const ev of picked) frag.appendChild(buildLine(ev));
+  liveEl.textContent = "";
+  liveEl.appendChild(frag);
+  logEl.scrollTop = logEl.scrollHeight;
+  updateHud();
+}
+
+function clearOlder() {
+  if (olderCount === 0 && !olderEl.firstChild) return;
+  olderEl.textContent = "";
+  olderCount = 0;
+  olderLowest.clear();
+  olderDone.clear();
+}
+
+function divider(text, gap) {
+  const d = document.createElement("div");
+  d.className = gap ? "divider gap" : "divider";
+  d.textContent = text;
+  return d;
+}
+
+// anchorFor returns the byte offset of the oldest line the UI holds for a
+// file: the lowest backfilled offset, else the first live line seen.
+function anchorFor(path) {
+  if (olderLowest.has(path)) return olderLowest.get(path);
+  return liveOldest.get(path); // may be undefined: server then anchors at EOF
+}
+
+async function loadOlder() {
+  if (loadingOlder) return;
+  const targets = [...files.values()].filter((f) => f.enabled && !olderDone.has(f.path));
+  if (!targets.length) return;
+  loadingOlder = true;
+  try {
+    const runs = [];
+    for (const f of targets) {
+      const q = new URLSearchParams({ file: f.path, limit: String(OLDER_PAGE) });
+      const anchor = anchorFor(f.path);
+      if (anchor !== undefined) q.set("offset", String(anchor));
+      let d;
+      try {
+        const r = await fetch("/api/before?" + q.toString());
+        if (!r.ok) { olderDone.add(f.path); continue; }
+        d = await r.json();
+      } catch { olderDone.add(f.path); continue; }
+      if (d.atStart) olderDone.add(f.path);
+      if (!Array.isArray(d.lines) || d.lines.length === 0) { olderDone.add(f.path); continue; }
+      olderLowest.set(f.path, d.lines[0].off);
+      runs.push({ f, lines: d.lines, atStart: !!d.atStart });
+    }
+    if (runs.length) prependOlder(runs);
+  } finally {
+    loadingOlder = false;
+  }
+}
+
+function prependOlder(runs) {
+  const frag = document.createDocumentFragment();
+  for (const run of runs) {
+    frag.appendChild(divider(
+      (run.atStart ? "start of " : "older · ") + run.f.name, false));
+    let shown = 0;
+    for (const ln of run.lines) {
+      const ev = { file: run.f.path, text: ln.text, off: ln.off, time: null };
+      if (!matches(ev)) continue;
+      frag.appendChild(buildLine(ev));
+      shown++;
+    }
+    olderCount += shown;
+  }
+  const prevHeight = logEl.scrollHeight;
+  const prevTop = logEl.scrollTop;
+  olderEl.insertBefore(frag, olderEl.firstChild);
+  // Keep the viewport anchored on the lines the user was reading.
+  logEl.scrollTop = prevTop + (logEl.scrollHeight - prevHeight);
+  // Bound the window: unload the newest part of the scrollback (the part
+  // the user already scrolled past) and mark the seam.
+  if (olderCount > OLDER_MAX) {
+    if (!olderEl.lastElementChild || !olderEl.lastElementChild.classList.contains("gap")) {
+      olderEl.appendChild(divider("· · · unloaded — jump to latest to reset · · ·", true));
+    }
+    const gapEl = olderEl.lastElementChild;
+    while (olderCount > OLDER_MAX && gapEl.previousElementSibling) {
+      const n = gapEl.previousElementSibling;
+      if (n.classList.contains("line")) olderCount--;
+      n.remove();
+    }
+  }
+  updateHud();
+}
+
+function setStatus(cls, text) {
+  statusDot.className = "dot" + (cls ? " " + cls : "");
+  statusText.textContent = text;
+}
+
+function connect() {
+  const es = new EventSource("/events");
+  es.onopen = () => setStatus("live", "live");
+  es.onerror = () => setStatus("reconnecting", "reconnecting");
+  es.onmessage = onLine;
+}
+
+function onLine(msg) {
+  let ev;
+  try { ev = JSON.parse(msg.data); } catch { return; }
+  if (typeof ev.seq !== "number" || ev.seq <= lastSeq) return; // replay dedupe
+  lastSeq = ev.seq;
+  if (!liveOldest.has(ev.file) && typeof ev.off === "number") liveOldest.set(ev.file, ev.off);
+  events.push(ev);
+  if (events.length > MAX_STORE) events.splice(0, events.length - MAX_STORE);
+  ensureFile(ev.file).count++;
+  if (!paused && matches(ev)) pendingNodes.push(buildLine(ev));
+  scheduleFlush();
+}
+
+let searchTimer;
+searchEl.addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    filter = searchEl.value.trim().toLowerCase();
+    rerender();
+  }, 150);
+});
+
+pauseBtn.addEventListener("click", () => {
+  paused = !paused;
+  pauseBtn.textContent = paused ? "Resume" : "Pause";
+  pauseBtn.classList.toggle("active", paused);
+  if (!paused) rerender(); // catch up on everything buffered while paused
+});
+
+clearBtn.addEventListener("click", () => {
+  events = [];
+  pendingNodes = [];
+  for (const f of files.values()) f.count = 0;
+  clearOlder();
+  liveEl.textContent = "";
+  updateHud();
+});
+
+maxLinesEl.addEventListener("change", () => {
+  const n = parseInt(maxLinesEl.value, 10);
+  maxLines = clampLines(Number.isNaN(n) ? maxLines : n);
+  maxLinesEl.value = maxLines;
+  localStorage.setItem(LINES_KEY, String(maxLines));
+  rerender();
+});
+
+jumpBtn.addEventListener("click", () => {
+  clearOlder();
+  logEl.scrollTop = logEl.scrollHeight;
+  jumpBtn.hidden = true;
+  updateHud();
+});
+
+logEl.addEventListener("scroll", () => {
+  jumpBtn.hidden = nearBottom();
+  if (logEl.scrollTop < 300) loadOlder();
+  else if (nearBottom()) { clearOlder(); updateHud(); }
+}, { passive: true });
+
+// A wheel-up at the very top produces no scroll event; catch it so
+// scrollback also starts when the content is shorter than the viewport.
+logEl.addEventListener("wheel", (e) => {
+  if (e.deltaY < 0 && logEl.scrollTop === 0) loadOlder();
+}, { passive: true });
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "/" && document.activeElement !== searchEl) {
+    e.preventDefault();
+    searchEl.focus();
+  } else if (e.key === "Escape" && document.activeElement === searchEl) {
+    searchEl.value = "";
+    filter = "";
+    searchEl.blur();
+    rerender();
+  }
+});
+
+// Register the file chips before opening the stream, so "the first file"
+// is deterministically the first one on the command line / in the config
+// (not whichever file happens to log first). Also pick up the server's
+// configured default line count unless the user chose one in this browser.
+async function init() {
+  try {
+    const d = await (await fetch("/api/files")).json();
+    (d.files || []).forEach(ensureFile);
+    if (localStorage.getItem(LINES_KEY) === null && Number.isInteger(d.lines) && d.lines > 0) {
+      maxLines = clampLines(d.lines);
+      maxLinesEl.value = maxLines;
+    }
+  } catch {
+    // Stream anyway; chips are then created as lines arrive.
+  }
+  connect();
+  updateHud();
+}
+init();
+</script>
+</body>
+</html>
