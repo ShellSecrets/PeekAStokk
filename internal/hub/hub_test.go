@@ -17,7 +17,7 @@ func TestHistoryReplay(t *testing.T) {
 	h := hub.New(10)
 	publishN(h, 3)
 
-	_, history := h.Subscribe(8, 0)
+	_, history := h.Subscribe(8, 0, nil)
 	if len(history) != 3 {
 		t.Fatalf("history length = %d, want 3", len(history))
 	}
@@ -32,7 +32,7 @@ func TestHistoryAfterSeqSkipsSeenEvents(t *testing.T) {
 	h := hub.New(10)
 	publishN(h, 5)
 
-	_, history := h.Subscribe(8, 3)
+	_, history := h.Subscribe(8, 3, nil)
 	if len(history) != 2 || history[0].Seq != 4 || history[1].Seq != 5 {
 		t.Fatalf("unexpected history %+v", history)
 	}
@@ -42,7 +42,7 @@ func TestHistoryRingDropsOldest(t *testing.T) {
 	h := hub.New(2)
 	publishN(h, 5)
 
-	_, history := h.Subscribe(8, 0)
+	_, history := h.Subscribe(8, 0, nil)
 	if len(history) != 2 || history[0].Seq != 4 || history[1].Seq != 5 {
 		t.Fatalf("unexpected history %+v", history)
 	}
@@ -50,8 +50,8 @@ func TestHistoryRingDropsOldest(t *testing.T) {
 
 func TestBroadcastReachesAllSubscribers(t *testing.T) {
 	h := hub.New(0)
-	a, _ := h.Subscribe(8, 0)
-	b, _ := h.Subscribe(8, 0)
+	a, _ := h.Subscribe(8, 0, nil)
+	b, _ := h.Subscribe(8, 0, nil)
 
 	h.Publish("app.log", "hello", 0, time.Now())
 
@@ -67,9 +67,37 @@ func TestBroadcastReachesAllSubscribers(t *testing.T) {
 	}
 }
 
+func TestFileFilterRestrictsHistoryAndDelivery(t *testing.T) {
+	h := hub.New(10)
+	h.Publish("a.log", "old-a", 0, time.Now())
+	h.Publish("b.log", "old-b", 0, time.Now())
+
+	sub, history := h.Subscribe(8, 0, []string{"b.log"})
+	if len(history) != 1 || history[0].Text != "old-b" {
+		t.Fatalf("history = %+v", history)
+	}
+
+	h.Publish("a.log", "live-a", 0, time.Now())
+	h.Publish("b.log", "live-b", 0, time.Now())
+
+	select {
+	case ev := <-sub.Events():
+		if ev.Text != "live-b" {
+			t.Fatalf("got %q, want live-b only", ev.Text)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out")
+	}
+	select {
+	case ev := <-sub.Events():
+		t.Fatalf("unexpected extra event %+v", ev)
+	default:
+	}
+}
+
 func TestSlowSubscriberIsEvicted(t *testing.T) {
 	h := hub.New(0)
-	slow, _ := h.Subscribe(1, 0)
+	slow, _ := h.Subscribe(1, 0, nil)
 	publishN(h, 3) // buffer holds 1; the second publish evicts
 
 	if ev, open := <-slow.Events(); !open || ev.Seq != 1 {
@@ -83,7 +111,7 @@ func TestSlowSubscriberIsEvicted(t *testing.T) {
 
 func TestCloseShutsDownSubscribers(t *testing.T) {
 	h := hub.New(0)
-	sub, _ := h.Subscribe(8, 0)
+	sub, _ := h.Subscribe(8, 0, nil)
 
 	h.Close()
 	if _, open := <-sub.Events(); open {
@@ -94,7 +122,7 @@ func TestCloseShutsDownSubscribers(t *testing.T) {
 	sub.Close()                                        // must not double-close
 	h.Close()                                          // idempotent
 
-	late, history := h.Subscribe(8, 0)
+	late, history := h.Subscribe(8, 0, nil)
 	if len(history) != 0 {
 		t.Fatalf("unexpected history %+v", history)
 	}

@@ -65,6 +65,9 @@ func (h *Hub) Publish(file, text string, off int64, ts time.Time) {
 	}
 
 	for s := range h.subs {
+		if !s.wants(ev.File) {
+			continue
+		}
 		select {
 		case s.ch <- ev:
 		default:
@@ -78,25 +81,36 @@ func (h *Hub) Publish(file, text string, off int64, ts time.Time) {
 
 // Subscribe registers a new subscriber whose channel holds up to buffer
 // undelivered events, and returns the retained history with sequence
-// numbers greater than afterSeq (pass 0 for the full history). Events
-// published after Subscribe returns are delivered on the channel, so the
-// history snapshot and the stream are gap-free. If the hub is already
-// closed, the returned subscriber's channel is closed.
-func (h *Hub) Subscribe(buffer int, afterSeq uint64) (*Subscriber, []Event) {
+// numbers greater than afterSeq (pass 0 for the full history). A non-empty
+// files list restricts both history and delivery to those file paths; nil
+// or empty means every file. Events published after Subscribe returns are
+// delivered on the channel, so the history snapshot and the stream are
+// gap-free. If the hub is already closed, the returned subscriber's channel
+// is closed.
+func (h *Hub) Subscribe(buffer int, afterSeq uint64, files []string) (*Subscriber, []Event) {
 	if buffer <= 0 {
 		buffer = 64
 	}
+	var want map[string]bool
+	if len(files) > 0 {
+		want = make(map[string]bool, len(files))
+		for _, f := range files {
+			want[f] = true
+		}
+	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	history := make([]Event, 0, h.count)
 	for i := 0; i < h.count; i++ {
-		if ev := h.ring[(h.start+i)%len(h.ring)]; ev.Seq > afterSeq {
+		ev := h.ring[(h.start+i)%len(h.ring)]
+		if ev.Seq > afterSeq && (want == nil || want[ev.File]) {
 			history = append(history, ev)
 		}
 	}
 
-	s := &Subscriber{hub: h, ch: make(chan Event, buffer)}
+	s := &Subscriber{hub: h, ch: make(chan Event, buffer), files: want}
 	if h.closed {
 		s.closed = true
 		close(s.ch)
@@ -126,8 +140,11 @@ func (h *Hub) Close() {
 type Subscriber struct {
 	hub    *Hub
 	ch     chan Event
-	closed bool // guarded by hub.mu
+	files  map[string]bool // nil means every file
+	closed bool            // guarded by hub.mu
 }
+
+func (s *Subscriber) wants(file string) bool { return s.files == nil || s.files[file] }
 
 // Events returns the delivery channel. It is closed when the subscriber is
 // evicted, the hub is closed, or Close is called.

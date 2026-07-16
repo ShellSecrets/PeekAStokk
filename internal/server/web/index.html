@@ -225,8 +225,15 @@ const OLDER_PAGE = 2000;  // lines fetched per request per file
 let olderCount = 0;
 let loadingOlder = false;
 const olderLowest = new Map(); // file -> lowest backfilled offset
-const liveOldest = new Map();  // file -> offset of first live line seen
+const liveOldest = new Map();  // file -> offset of oldest line held
 const olderDone = new Set();   // files whose beginning has been reached
+
+// Lazy loading: the stream only carries selected files (?files= on
+// /events). Enabling a file loads its recent lines from disk, then joins
+// its live stream; "floors" drops the few live events that could overlap
+// the disk snapshot during that handover.
+const floors = new Map(); // file -> ignore live events below this offset
+let es = null;
 
 function ensureFile(path) {
   let f = files.get(path);
@@ -251,11 +258,7 @@ function ensureFile(path) {
   count.className = "count";
   count.textContent = "0";
   chip.append(label, count);
-  chip.addEventListener("click", () => {
-    f.enabled = !f.enabled;
-    chip.classList.toggle("off", !f.enabled);
-    rerender();
-  });
+  chip.addEventListener("click", () => { toggleFile(f); });
   chipsEl.appendChild(chip);
   f.chipEl = chip;
   f.countEl = count;
@@ -346,7 +349,9 @@ function scheduleFlush() {
 }
 
 function updateHud() {
-  for (const f of files.values()) f.countEl.textContent = f.count.toLocaleString();
+  for (const f of files.values()) {
+    f.countEl.textContent = f.enabled ? f.count.toLocaleString() : "–";
+  }
   let stats = `${events.length.toLocaleString()} buffered · ${liveEl.childElementCount.toLocaleString()} shown`;
   if (olderCount > 0) stats += ` · ${olderCount.toLocaleString()} older`;
   statsEl.textContent = stats;
@@ -459,8 +464,21 @@ function setStatus(cls, text) {
   statusText.textContent = text;
 }
 
+// connect (re)opens the event stream for the currently selected files.
+// With nothing selected there is nothing to stream, so no connection is
+// held at all.
 function connect() {
-  const es = new EventSource("/events");
+  if (es) { es.close(); es = null; }
+  const selected = [...files.values()].filter((f) => f.enabled);
+  if (files.size > 0 && selected.length === 0) {
+    setStatus("", "no file selected");
+    return;
+  }
+  const q = new URLSearchParams();
+  for (const f of selected) q.append("files", f.path);
+  if (lastSeq > 0) q.set("after", String(lastSeq));
+  const qs = q.toString();
+  es = new EventSource("/events" + (qs ? "?" + qs : ""));
   es.onopen = () => setStatus("live", "live");
   es.onerror = () => setStatus("reconnecting", "reconnecting");
   es.onmessage = onLine;
@@ -471,12 +489,60 @@ function onLine(msg) {
   try { ev = JSON.parse(msg.data); } catch { return; }
   if (typeof ev.seq !== "number" || ev.seq <= lastSeq) return; // replay dedupe
   lastSeq = ev.seq;
+  const f = ensureFile(ev.file);
+  if (!f.enabled) return; // server filters; this guards fallback modes
+  const floor = floors.get(ev.file);
+  if (floor !== undefined) {
+    if (typeof ev.off === "number" && ev.off < floor) return; // already shown from disk
+    floors.delete(ev.file);
+  }
   if (!liveOldest.has(ev.file) && typeof ev.off === "number") liveOldest.set(ev.file, ev.off);
   events.push(ev);
   if (events.length > MAX_STORE) events.splice(0, events.length - MAX_STORE);
-  ensureFile(ev.file).count++;
+  f.count++;
   if (!paused && matches(ev)) pendingNodes.push(buildLine(ev));
   scheduleFlush();
+}
+
+// toggleFile is the chip click: enabling loads the file's recent lines
+// from disk and joins its live stream; disabling purges it from memory and
+// drops it from the stream.
+async function toggleFile(f) {
+  f.enabled = !f.enabled;
+  f.chipEl.classList.toggle("off", !f.enabled);
+  f.chipEl.title = f.path + (f.enabled ? "" : " — click to show");
+
+  if (!f.enabled) {
+    events = events.filter((e) => e.file !== f.path);
+    liveOldest.delete(f.path);
+    floors.delete(f.path);
+    f.count = 0;
+    rerender();
+    connect();
+    return;
+  }
+
+  rerender();
+  try {
+    const q = new URLSearchParams({ file: f.path, limit: String(maxLines) });
+    const d = await (await fetch("/api/before?" + q.toString())).json();
+    if (Array.isArray(d.lines) && d.lines.length) {
+      const last = d.lines[d.lines.length - 1];
+      floors.set(f.path, last.off + last.text.length + 1);
+      liveOldest.set(f.path, d.lines[0].off);
+      if (d.atStart) olderDone.add(f.path);
+      const loaded = d.lines.map((ln) => ({
+        seq: 0, file: f.path, text: ln.text, off: ln.off, time: null,
+      }));
+      events = loaded.concat(events);
+      if (events.length > MAX_STORE) events.splice(0, events.length - MAX_STORE);
+      f.count = loaded.length;
+      rerender();
+    }
+  } catch {
+    // Disk load failed; live lines will still stream in below.
+  }
+  connect();
 }
 
 let searchTimer;

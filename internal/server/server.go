@@ -91,16 +91,44 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// EventSource sends Last-Event-ID on reconnect; replay only what the
-	// client has not seen.
+	// Replay only what the client has not seen. EventSource sends
+	// Last-Event-ID on automatic reconnects; the UI passes ?after= when it
+	// deliberately reconnects with a different file selection. Take the
+	// newer of the two.
 	var afterSeq uint64
 	if v := r.Header.Get("Last-Event-ID"); v != "" {
 		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
 			afterSeq = n
 		}
 	}
+	if v := r.URL.Query().Get("after"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil && n > afterSeq {
+			afterSeq = n
+		}
+	}
 
-	sub, history := s.hub.Subscribe(subscriberBuffer, afterSeq)
+	// An optional files filter (repeated ?files= values) restricts the
+	// stream to selected files, so unselected files cost the client
+	// nothing. Absent means every file.
+	var fileFilter []string
+	if vals, ok := r.URL.Query()["files"]; ok {
+		for _, v := range vals {
+			if v == "" {
+				continue
+			}
+			if !s.fileSet[v] {
+				http.Error(w, "unknown file in files filter", http.StatusBadRequest)
+				return
+			}
+			fileFilter = append(fileFilter, v)
+		}
+		if len(fileFilter) == 0 {
+			http.Error(w, "files filter is empty", http.StatusBadRequest)
+			return
+		}
+	}
+
+	sub, history := s.hub.Subscribe(subscriberBuffer, afterSeq, fileFilter)
 	defer sub.Close()
 
 	h := w.Header()

@@ -33,10 +33,12 @@ go install github.com/shellsecrets/peekastokk@latest
   to the first line. Only a small window stays in the browser: the part you
   scrolled past is unloaded, and jumping back to the tail frees it all. The
   server keeps nothing extra in memory — the log file itself is the archive.
-- **Multi-file** — each file gets a colored badge and a toggle chip. Only
-  the first file is shown when the UI opens; the others keep buffering in
-  the background (their counts tick on the chips) and appear instantly when
-  their chip is clicked.
+- **Multi-file, loaded lazily** — each file gets a colored badge and a
+  toggle chip. Only the first file is streamed when the UI opens; the
+  others cost nothing (no bandwidth, no browser memory — the stream itself
+  is filtered server-side per client) until their chip is clicked, which
+  loads their recent lines straight from disk and joins their live stream.
+  Deselecting a file purges it from browser memory again.
 - **Filtering** — substring filter with match highlighting (`/` to focus,
   `Esc` to clear); error/warning lines are tinted automatically.
 - **Pause, clear, follow** — the view sticks to the bottom until you scroll
@@ -109,7 +111,7 @@ config file's `file` list entirely.
 | Path         | Description                          |
 |--------------|--------------------------------------|
 | `/`          | Web UI (embedded, single file)       |
-| `/events`    | SSE stream of log lines (JSON)       |
+| `/events`    | SSE stream of log lines (JSON); `?files=` (repeatable) limits the stream to selected files, `?after=` resumes past a sequence number |
 | `/api/files` | List of tailed files                 |
 | `/api/before`| Older lines read from disk for scrollback (`file`, `offset`, `limit`) — only tailed files are readable |
 | `/healthz`   | Health check                         |

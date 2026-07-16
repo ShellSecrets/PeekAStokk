@@ -157,6 +157,70 @@ func TestEventStreamHonorsLastEventID(t *testing.T) {
 	}
 }
 
+func TestEventStreamFilesFilter(t *testing.T) {
+	h := hub.New(10)
+	h.Publish("a.log", "from-a", 0, time.Now())
+	h.Publish("b.log", "from-b", 0, time.Now())
+	ts := newTestServer(t, h)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/events?files=b.log", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	reader := bufio.NewReader(resp.Body)
+	history := readEvents(t, reader, 1)
+	if history[0].Text != "from-b" {
+		t.Fatalf("history = %+v", history)
+	}
+
+	h.Publish("a.log", "live-a", 0, time.Now())
+	h.Publish("b.log", "live-b", 0, time.Now())
+	live := readEvents(t, reader, 1)
+	if live[0].Text != "live-b" {
+		t.Fatalf("live = %+v, want only b.log events", live[0])
+	}
+}
+
+func TestEventStreamAfterParam(t *testing.T) {
+	h := hub.New(10)
+	h.Publish("a.log", "first", 0, time.Now())
+	h.Publish("a.log", "second", 0, time.Now())
+	ts := newTestServer(t, h)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/events?after=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	events := readEvents(t, bufio.NewReader(resp.Body), 1)
+	if events[0].Seq != 2 || events[0].Text != "second" {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestEventStreamRejectsBadFilesFilter(t *testing.T) {
+	ts := newTestServer(t, hub.New(10))
+	for _, q := range []string{"?files=nope.log", "?files="} {
+		resp, err := http.Get(ts.URL + "/events" + q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", q, resp.StatusCode)
+		}
+	}
+}
+
 func TestEventStreamEndsWhenHubCloses(t *testing.T) {
 	h := hub.New(10)
 	ts := newTestServer(t, h)
