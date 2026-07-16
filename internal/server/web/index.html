@@ -179,8 +179,10 @@
     font-size: 12.5px;
   }
   .line:hover { background: rgba(255,255,255,.04); }
-  .ts { color: var(--muted); flex: none; }
-  .badge { color: var(--c, var(--accent)); flex: none; font-weight: 600; }
+  /* Only the log text itself is selectable: copying lines must not drag
+     the timestamp and file-name columns along. */
+  .ts { color: var(--muted); flex: none; user-select: none; }
+  .badge { color: var(--c, var(--accent)); flex: none; font-weight: 600; user-select: none; }
   .txt { white-space: pre-wrap; word-break: break-word; min-width: 0; }
   .lvl-error .txt { color: var(--err); }
   .lvl-warn .txt { color: var(--warn); }
@@ -301,6 +303,15 @@ const olderDone = new Set();   // files whose beginning has been reached
 // the disk snapshot during that handover.
 const floors = new Map(); // file -> ignore live events below this offset
 let es = null;
+
+// The app's own scrollTop assignments fire scroll events too; the handler
+// must not mistake them for user intent (that both loaded scrollback
+// spontaneously and instantly wiped it again on short content).
+let ignoreScrollUntil = 0;
+function programmaticScroll(top) {
+  logEl.scrollTop = top;
+  ignoreScrollUntil = performance.now() + 200;
+}
 
 function ensureFile(id, name) {
   let f = files.get(id);
@@ -473,16 +484,16 @@ function scheduleFlush() {
   requestAnimationFrame(() => {
     rafScheduled = false;
     if (pendingNodes.length) {
-      const stick = nearBottom();
+      // Follow the tail only while no scrollback is open: reading history
+      // pauses auto-scroll, otherwise live traffic would keep yanking the
+      // view (and freeing the history) underneath the reader.
+      const follow = olderCount === 0 && nearBottom();
       const frag = document.createDocumentFragment();
       for (const n of pendingNodes) frag.appendChild(n);
       pendingNodes = [];
       liveEl.appendChild(frag);
       while (liveEl.childElementCount > maxLines) liveEl.firstElementChild.remove();
-      if (stick) {
-        clearOlder(); // back at the tail: release the scrollback window
-        logEl.scrollTop = logEl.scrollHeight;
-      }
+      if (follow) programmaticScroll(logEl.scrollHeight);
     }
     updateHud();
   });
@@ -495,7 +506,7 @@ function updateHud() {
   let stats = `${events.length.toLocaleString()} buffered · ${liveEl.childElementCount.toLocaleString()} shown`;
   if (olderCount > 0) stats += ` · ${olderCount.toLocaleString()} older`;
   statsEl.textContent = stats;
-  jumpBtn.hidden = nearBottom();
+  jumpBtn.hidden = nearBottom() && olderCount === 0;
 }
 
 function rerender() {
@@ -510,7 +521,7 @@ function rerender() {
   for (const ev of picked) frag.appendChild(buildLine(ev));
   liveEl.textContent = "";
   liveEl.appendChild(frag);
-  logEl.scrollTop = logEl.scrollHeight;
+  programmaticScroll(logEl.scrollHeight);
   updateHud();
 }
 
@@ -582,7 +593,7 @@ function prependOlder(runs) {
   const prevTop = logEl.scrollTop;
   olderEl.insertBefore(frag, olderEl.firstChild);
   // Keep the viewport anchored on the lines the user was reading.
-  logEl.scrollTop = prevTop + (logEl.scrollHeight - prevHeight);
+  programmaticScroll(prevTop + (logEl.scrollHeight - prevHeight));
   // Bound the window: unload the newest part of the scrollback (the part
   // the user already scrolled past) and mark the seam.
   if (olderCount > OLDER_MAX) {
@@ -720,15 +731,28 @@ maxLinesEl.addEventListener("change", () => {
 
 jumpBtn.addEventListener("click", () => {
   clearOlder();
-  logEl.scrollTop = logEl.scrollHeight;
+  programmaticScroll(logEl.scrollHeight);
   jumpBtn.hidden = true;
   updateHud();
 });
 
+// Scrollback loads only on a deliberate upward scroll, and is freed only
+// when the user deliberately comes back down to the tail (or hits "Jump to
+// latest"). Programmatic scrolls are ignored via ignoreScrollUntil.
+let lastScrollTop = 0;
 logEl.addEventListener("scroll", () => {
-  jumpBtn.hidden = nearBottom();
-  if (logEl.scrollTop < 300) loadOlder();
-  else if (nearBottom()) { clearOlder(); updateHud(); }
+  const st = logEl.scrollTop;
+  const scrolledUp = st < lastScrollTop;
+  lastScrollTop = st;
+  jumpBtn.hidden = nearBottom() && olderCount === 0;
+  if (performance.now() < ignoreScrollUntil) return;
+  if (scrolledUp && st < 300 && logEl.scrollHeight > logEl.clientHeight) {
+    loadOlder();
+  } else if (!scrolledUp && olderCount > 0 && nearBottom()) {
+    clearOlder();
+    programmaticScroll(logEl.scrollHeight);
+    updateHud();
+  }
 }, { passive: true });
 
 // A wheel-up at the very top produces no scroll event; catch it so
