@@ -31,11 +31,14 @@ archives:
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
     # Setting `files` replaces GoReleaser's default README*/LICENSE* glob,
     # so list those explicitly alongside config.example (install.sh seeds
-    # /etc/peekastokk/config from it).
+    # /etc/peekastokk/config from it) and the man page (install.sh installs
+    # it to the system man path).
     files:
       - LICENSE*
       - README*
       - config.example
+      - src: man/peekastokk.1
+        dst: peekastokk.1
 
 checksum:
   name_template: "checksums.txt"

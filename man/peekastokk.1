@@ -1,0 +1,294 @@
+.TH PEEKASTOKK 1 "2026-07-18" "PeekAStokk" "User Commands"
+.SH NAME
+peekastokk \- live log viewer in the browser
+.SH SYNOPSIS
+.B peekastokk
+[\fIflags\fR] [\fIlogfile\fR|\fIdirectory\fR|\fIglob\fR ...]
+.SH DESCRIPTION
+.B peekastokk
+tails one or more log files and streams them live to an embedded web UI
+over Server-Sent Events. Point it at plain files, directories (every file
+directly inside one is tailed), or glob patterns
+.RI ( /var/log/*.log ),
+then open the printed URL in a browser to filter, search, and follow the
+files as they grow.
+.PP
+It survives log rotation (both rename+recreate and copytruncate styles),
+waits for files that do not exist yet, and bounds its own memory use
+regardless of how large or fast-moving the tailed files are. Nothing is
+persisted to disk by the program itself; the log files it reads are the
+only state.
+.SH ARGUMENTS
+Each positional argument is one of:
+.TP
+.I logfile
+A plain path. If it does not exist yet,
+.B peekastokk
+waits for it to be created.
+.TP
+.I directory
+Every regular file directly inside the directory is tailed as its own
+log. Dot-files and subdirectories are skipped (not recursive). An empty
+directory is a startup error.
+.TP
+.I glob
+A shell glob pattern such as
+.I '/var/log/*.log'
+or
+.IR '/var/log/myproject*' .
+Quote it so your shell passes it through unexpanded; matching directories
+are skipped. A pattern that matches nothing is a startup error.
+.PP
+If no arguments are given, the files listed as
+.B file
+entries in the configuration file are used instead (see
+.B CONFIGURATION FILE
+below). At least one file, directory, or pattern is required from one
+source or the other.
+.SH OPTIONS
+.TP
+.BI \-addr " address"
+HTTP listen address. Default:
+.IR 127.0.0.1:8844 .
+Binding to anything other than loopback should be paired with
+.B \-auth
+and a TLS-terminating reverse proxy; see
+.B SECURITY
+below.
+.TP
+.BI \-history " n"
+Number of recent lines the server keeps in memory and replays to a newly
+connected or reconnecting browser. Default:
+.IR 2000 .
+.TP
+.BI \-lines " n"
+Default number of lines the web UI keeps rendered on screen; adjustable
+live in the UI, where a browser's own choice is then remembered across
+reloads. Default:
+.IR 500 .
+.TP
+.BI \-poll " duration"
+How often each tailed file is checked for new data. Default:
+.IR 200ms .
+.TP
+.BI \-tail\-bytes " n"
+Maximum bytes of a file's existing content replayed at startup, aligned
+to the next line boundary. A negative value starts at the end of the
+file instead (no replay). Default:
+.IR 65536 .
+.TP
+.BI \-max\-line\-bytes " n"
+Lines longer than this are split into chunks, so a file without newlines
+cannot grow memory without bound. Default:
+.IR 262144 .
+.TP
+.BI \-log\-level " level"
+One of
+.IR debug ", " info ", " warn ", or " error .
+Default:
+.IR info .
+.TP
+.BI \-auth " user:password"
+Require HTTP basic authentication to view the UI, the event stream, and
+the API; empty (the default) leaves it open. The password half may be a
+plaintext string or an Argon2id hash produced by
+.B \-hash\-password
+(preferred \(em see
+.B SECURITY
+below).
+Passing
+.B \-auth
+with an empty value on the command line disables authentication even
+when the configuration file enables it.
+.TP
+.B \-hash\-password
+Prompt for a password (input hidden, asked twice, on a terminal; read as
+a single piped line otherwise), print its Argon2id hash in PHC string
+format, and exit. Paste the result after
+.IR user: " in the " auth " setting."
+.TP
+.BI \-config " path"
+Load configuration from this file instead of searching the standard
+locations (see
+.B FILES
+below).
+.TP
+.B \-version
+Print the version and exit.
+.SH CONFIGURATION FILE
+Every setting
+.B peekastokk
+accepts as a flag, plus a repeatable
+.B file
+entry for the tailed files, may instead live in a plain
+.IR "key = value"
+configuration file. Command-line flags override the configuration file,
+which overrides built-in defaults; log files given as command-line
+arguments replace the configuration file's
+.B file
+list entirely rather than merging with it.
+.PP
+Recognized keys:
+.IR addr ", " port " (shorthand for the port half of " addr "), " history ,
+.IR lines ", " poll ", " tail\-bytes ", " max\-line\-bytes ", " log\-level ,
+.IR auth ", and the repeatable " file .
+Blank lines and lines starting with
+.B #
+or
+.B ;
+are ignored, as is an unquoted trailing comment (a
+.B #
+preceded by whitespace). Quote a value to keep a literal
+.B #
+or surrounding spaces. In
+.B file
+values a leading
+.B ~
+expands to the home directory and relative paths resolve against the
+directory containing the configuration file itself. An unknown or
+malformed key is a startup error naming the offending line.
+.PP
+Example:
+.nf
+.RS
+port      = 9000
+history   = 5000
+log\-level = info
+
+file = /var/log/app.log
+file = ~/logs/worker.log
+file = /var/log/nginx/*.log
+.RE
+.fi
+.PP
+A fully commented, ready-to-copy example ships as
+.I config.example
+in the project repository, and is installed to
+.I /etc/peekastokk/config.example
+by
+.I install.sh
+(see
+.B FILES
+below).
+.SH ENDPOINTS
+The web UI is a single embedded page served at
+.IR / .
+It also exposes:
+.TP
+.I /events
+The Server-Sent Events stream (JSON lines). Accepts a repeatable
+.I files
+query parameter (opaque per-file ids, not paths) to limit the stream to
+selected files, and an
+.I after
+parameter to resume past a sequence number.
+.TP
+.I /api/files
+The list of tailed files as opaque ids and display names; absolute paths
+are never exposed to the client.
+.TP
+.I /api/before
+Older lines read backwards from disk for the UI's scrollback, bounded to
+files this process is actually tailing.
+.TP
+.I /healthz
+A liveness probe. Always reachable without authentication, even when
+.B \-auth
+is set.
+.SH ENVIRONMENT
+.TP
+.B XDG_CONFIG_HOME
+Overrides the default location searched for a user-level configuration
+file (see
+.B FILES
+below). Not required; only consulted when
+.B \-config
+is not given.
+.SH FILES
+Unless
+.B \-config
+is given, a configuration file is searched for in this order, and the
+first one found is used:
+.TP
+.I $XDG_CONFIG_HOME/peekastokk/config
+Defaults to
+.I ~/.config/peekastokk/config
+when
+.B XDG_CONFIG_HOME
+is unset.
+.TP
+.I ~/.peekastokk
+A plain file.
+.TP
+.I ~/.peekastokk/config
+.TP
+.I /etc/peekastokk/config
+An unconditional system-wide fallback, checked last after every
+user-specific location. This is what a service account with no
+meaningful home directory resolves to, with no extra environment setup
+required \(em see the
+.B "Running as a service"
+section of the project README for running it this way.
+.SH EXIT STATUS
+.B 0
+on a clean shutdown (SIGINT or SIGTERM);
+.B 1
+on any startup failure, including a port already in use, a malformed
+configuration file, or no log files resolved from arguments or
+configuration.
+.SH SIGNALS
+.B SIGINT
+and
+.B SIGTERM
+trigger a graceful shutdown: the HTTP server stops accepting new
+connections, in-flight Server-Sent Events streams are closed, and file
+tailers are stopped before the process exits. This is what
+.I systemctl stop
+sends.
+.SH SECURITY
+.B peekastokk
+serves whatever it tails, without authentication, unless
+.B \-auth
+is set. It binds to loopback by default; if exposed on another interface
+with
+.BR \-addr ,
+enable
+.B \-auth
+and put a TLS-terminating reverse proxy in front, since HTTP basic
+authentication is sent unencrypted otherwise. Prefer an Argon2id hash
+(via
+.BR \-hash\-password )
+over a plaintext password in the configuration file, which is only ever
+readable by root and the service group when installed via the project's
+.I install.sh
+(mode 0640).
+.PP
+Absolute file paths never reach the client: the API, the event stream,
+and the scrollback endpoint all speak in opaque per-file ids and
+deduplicated base names, never the underlying path.
+.SH EXAMPLES
+.TP
+Tail two specific files:
+.B "peekastokk /var/log/app.log /var/log/nginx/access.log"
+.TP
+Tail every file in a directory:
+.B "peekastokk /var/log/myapp/"
+.TP
+Tail by glob pattern (quoted so the shell does not expand it):
+.B "peekastokk '/var/log/*.log'"
+.TP
+Listen on all interfaces with authentication:
+.B "peekastokk \-addr 0.0.0.0:8844 \-auth dev:s3cret /var/log/app.log"
+.TP
+Generate a password hash for the configuration file:
+.B "peekastokk \-hash\-password"
+.SH SEE ALSO
+Full documentation, the annotated
+.IR config.example ,
+and the systemd service instructions:
+.RI < https://github.com/shellsecrets/peekastokk >
+.SH AUTHOR
+PeekAStokk contributors.
+.SH BUGS
+Report issues at
+.RI < https://github.com/shellsecrets/peekastokk/issues >.

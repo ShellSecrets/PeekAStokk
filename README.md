@@ -40,16 +40,17 @@ go install github.com/shellsecrets/peekastokk@latest
 ### Linux install script (with systemd service)
 
 For a Linux server, `install.sh` detects the CPU (x86/ARM, 32/64-bit),
-downloads the matching [release](#quick-start) binary to `/usr/local/bin`,
-creates an unprivileged system service account, and — when systemd is the
-running init — installs and enables a hardened unit:
+downloads the matching [release](#quick-start) binary and its man page to
+`/usr/local`, creates an unprivileged system service account, and — when
+systemd is the running init — installs and enables a hardened unit:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/shellsecrets/peekastokk/main/install.sh | sudo sh
+man peekastokk
 ```
 
-On any other init system, only the binary is installed; wire it up to
-whatever supervises services on that system yourself. See
+On any other init system, only the binary and man page are installed; wire
+the service up to whatever supervises services on that system yourself. See
 [Running as a service](#running-as-a-service) below for the account and
 log-access details.
 

@@ -1,10 +1,10 @@
 #!/bin/sh
 # PeekAStokk installer: Linux only, downloads the right release binary for
-# this machine's CPU, installs it to /usr/local/bin, creates an
-# unprivileged system service account, and — when systemd is the running
+# this machine's CPU, installs it (with its man page) to /usr/local, creates
+# an unprivileged system service account, and — when systemd is the running
 # init system — installs and enables a hardened systemd unit. On any other
-# init system only the binary is installed; wire it up to your init/
-# supervisor of choice yourself.
+# init system only the binary and man page are installed; wire the service
+# up to your init/supervisor of choice yourself.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/shellsecrets/peekastokk/main/install.sh | sudo sh
@@ -14,6 +14,7 @@
 #   PEEKASTOKK_VERSION  a release tag to install instead of the latest (e.g. v1.1)
 #   PEEKASTOKK_USER     service account name (default: peekastokk)
 #   PEEKASTOKK_BINDIR   where to install the binary (default: /usr/local/bin)
+#   PEEKASTOKK_MANDIR   where to install the man page (default: /usr/local/share/man/man1)
 #
 # This script is written for POSIX sh (no bashisms: no arrays, no `[[ ]]`,
 # no `local`) so it runs the same under dash, ash/busybox, and bash.
@@ -25,6 +26,7 @@ VERSION="${PEEKASTOKK_VERSION:-latest}"
 SERVICE_USER="${PEEKASTOKK_USER:-peekastokk}"
 BINDIR="${PEEKASTOKK_BINDIR:-/usr/local/bin}"
 BIN_PATH="$BINDIR/peekastokk"
+MANDIR="${PEEKASTOKK_MANDIR:-/usr/local/share/man/man1}"
 CONFIG_DIR="/etc/peekastokk"
 UNIT_PATH="/etc/systemd/system/peekastokk.service"
 
@@ -126,6 +128,23 @@ mkdir -p "$BINDIR"
 install -m 0755 "$workdir/peekastokk" "$BIN_PATH"
 info "installed $BIN_PATH ($("$BIN_PATH" -version 2>/dev/null || echo unknown))"
 
+# --- install the man page -------------------------------------------------
+
+if [ -f "$workdir/peekastokk.1" ]; then
+	mkdir -p "$MANDIR"
+	install -m 0644 "$workdir/peekastokk.1" "$MANDIR/peekastokk.1"
+	# Refresh the whatis/apropos database if this system keeps one; harmless
+	# to skip (man still finds the page by path either way) when it doesn't.
+	if have mandb; then
+		mandb -q >/dev/null 2>&1 || true
+	elif have makewhatis; then
+		makewhatis "$MANDIR" >/dev/null 2>&1 || true
+	fi
+	info "installed man page: $MANDIR/peekastokk.1 (try: man peekastokk)"
+else
+	warn "release archive did not include a man page; skipping"
+fi
+
 # --- unprivileged service account -----------------------------------------
 
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
@@ -155,6 +174,11 @@ fi
 # --- config directory ------------------------------------------------------
 
 mkdir -p "$CONFIG_DIR"
+if [ -f "$workdir/config.example" ]; then
+	# Always refreshed on (re)install, unlike config itself: a pristine
+	# reference copy that survives you editing the live config.
+	cp "$workdir/config.example" "$CONFIG_DIR/config.example"
+fi
 if [ ! -e "$CONFIG_DIR/config" ]; then
 	if [ -f "$workdir/config.example" ]; then
 		cp "$workdir/config.example" "$CONFIG_DIR/config"
@@ -167,6 +191,7 @@ fi
 chown -R "root:$SERVICE_USER" "$CONFIG_DIR"
 chmod 0750 "$CONFIG_DIR"
 chmod 0640 "$CONFIG_DIR/config"
+[ -f "$CONFIG_DIR/config.example" ] && chmod 0640 "$CONFIG_DIR/config.example"
 
 # --- systemd unit, only when systemd is the running init -------------------
 
@@ -231,4 +256,4 @@ else
 	warn "whatever init you use, '$SERVICE_USER' will also need read access granted to any configured log paths (see the README)."
 fi
 
-info "done. binary: $BIN_PATH  config: $CONFIG_DIR/config  user: $SERVICE_USER"
+info "done. binary: $BIN_PATH  man: $MANDIR/peekastokk.1  config: $CONFIG_DIR/config  user: $SERVICE_USER"
