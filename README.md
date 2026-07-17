@@ -37,6 +37,22 @@ Or install directly:
 go install github.com/shellsecrets/peekastokk@latest
 ```
 
+### Linux install script (with systemd service)
+
+For a Linux server, `install.sh` detects the CPU (x86/ARM, 32/64-bit),
+downloads the matching [release](#quick-start) binary to `/usr/local/bin`,
+creates an unprivileged system service account, and — when systemd is the
+running init — installs and enables a hardened unit:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/shellsecrets/peekastokk/main/install.sh | sudo sh
+```
+
+On any other init system, only the binary is installed; wire it up to
+whatever supervises services on that system yourself. See
+[Running as a service](#running-as-a-service) below for the account and
+log-access details.
+
 ## Features
 
 - **Live streaming** over Server-Sent Events — the browser reconnects
@@ -78,6 +94,10 @@ searched in this order (first match wins), or given explicitly with
 1. `$XDG_CONFIG_HOME/peekastokk/config` (defaults to `~/.config/peekastokk/config`)
 2. `~/.peekastokk` (a plain file)
 3. `~/.peekastokk/config`
+4. `/etc/peekastokk/config` — a system-wide fallback, checked last. This is
+   what a service account with no real home directory resolves to (see
+   [Running as a service](#running-as-a-service)), with no extra
+   environment setup needed.
 
 Format is simple `key = value`; keys match the flag names, plus `port` as a
 shorthand and a repeatable `file`:
@@ -159,6 +179,45 @@ the command line overrides the config back to open access. Credentials are
 compared in constant time, the slow hash verification is cached per process
 and serialized (no CPU-burn from brute-force floods), and rejected attempts
 are logged.
+
+## Running as a service
+
+Don't run PeekAStokk as root — it only ever needs to *read* log files and
+serve HTTP, neither of which needs privilege. `install.sh` creates a
+dedicated, unprivileged system account for this (`peekastokk` by default:
+no login shell, no home directory) and, on systemd, runs the unit as that
+user with most of the usual hardening (`NoNewPrivileges`, no capabilities,
+`ProtectSystem=strict`, etc.) — filesystem *reads* are deliberately left
+unrestricted by the unit, since tailed log paths vary by deployment; only
+writes and privilege escalation are locked down.
+
+That leaves one real question: **how does an unprivileged account get read
+access to logs it doesn't own?** In rough order of preference:
+
+1. **POSIX ACLs** (recommended — works for any file, any owner, no group
+   juggling):
+   ```sh
+   setfacl -R -m u:peekastokk:rX /var/log/myapp
+   setfacl -R -d -m u:peekastokk:rX /var/log/myapp   # applies to future files too
+   ```
+2. **Group membership**, when the logs are already group-readable — add
+   the service account to that group (`install.sh` does this automatically
+   for Debian/Ubuntu's `adm` group, which covers most of `/var/log`):
+   ```sh
+   usermod -aG appgroup peekastokk
+   ```
+3. **Loosen the log file's permissions** (`chmod o+r`) only if the log
+   truly has nothing sensitive in it — usually the least good option.
+
+The config lives at `/etc/peekastokk/config` (root-owned, mode `0640`,
+readable by the `peekastokk` group) since it may later hold an auth
+password hash. Edit it to add your `file =` entries, then:
+
+```sh
+sudo systemctl enable --now peekastokk
+sudo systemctl status peekastokk
+journalctl -u peekastokk -f
+```
 
 ## Security note
 

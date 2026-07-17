@@ -4,6 +4,7 @@
 #   $XDG_CONFIG_HOME/peekastokk/config   (~/.config/peekastokk/config)
 #   ~/.peekastokk
 #   ~/.peekastokk/config
+#   /etc/peekastokk/config               (system-wide fallback, checked last)
 # or point at it explicitly with:  peekastokk -config /path/to/config
 #
 # Every key is optional; command-line flags override anything set here.

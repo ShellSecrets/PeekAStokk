@@ -20,13 +20,16 @@ func writeFile(t *testing.T, path, content string) {
 	}
 }
 
-// isolateHome points HOME (and clears XDG_CONFIG_HOME) at a temp dir so
-// tests never see the developer's real config.
+// isolateHome points HOME (and clears XDG_CONFIG_HOME) at a temp dir, and
+// redirects the /etc fallback into that same temp dir (to a path that does
+// not exist), so tests never see the developer's or the machine's real
+// config.
 func isolateHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Cleanup(config.SetEtcConfigPathForTest(filepath.Join(home, "unused-etc-config")))
 	return home
 }
 
@@ -222,6 +225,31 @@ func TestSearchOrder(t *testing.T) {
 		t.Fatalf("(%+v, %v), want Port 1 (XDG)", cfg, err)
 	}
 	_ = dotFile
+}
+
+func TestEtcFallbackIsLastResort(t *testing.T) {
+	home := isolateHome(t) // also points etcConfigPath at a path that doesn't exist
+
+	// Redirect etcConfigPath again, this time to a real file, to exercise
+	// the fallback itself without touching the real /etc.
+	etcPath := filepath.Join(home, "etc-peekastokk-config")
+	t.Cleanup(config.SetEtcConfigPathForTest(etcPath))
+	writeFile(t, etcPath, "port = 9\n")
+
+	cfg, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg == nil || cfg.Port != 9 || cfg.Path != etcPath {
+		t.Fatalf("cfg = %+v, want the /etc fallback to be used", cfg)
+	}
+
+	// Any user-level config, even the lowest-priority one, still wins over
+	// the system-wide fallback.
+	writeFile(t, filepath.Join(home, ".peekastokk"), "port = 4\n")
+	if cfg, err = config.Load(""); err != nil || cfg.Port != 4 {
+		t.Fatalf("(%+v, %v), want Port 4 (~/.peekastokk beats /etc)", cfg, err)
+	}
 }
 
 func TestXDGDefaultsToDotConfig(t *testing.T) {

@@ -24,6 +24,11 @@
 //	$XDG_CONFIG_HOME/peekastokk/config   (~/.config/peekastokk/config)
 //	~/.peekastokk
 //	~/.peekastokk/config
+//	/etc/peekastokk/config
+//
+// The last entry is an unconditional, environment-independent fallback —
+// it is what a systemd (or other init) service account with no meaningful
+// $HOME resolves to, without needing any special environment setup.
 package config
 
 import (
@@ -87,6 +92,11 @@ func Load(explicitPath string) (*Config, error) {
 	return c, nil
 }
 
+// etcConfigPath is the unconditional system-wide fallback, checked last.
+// A var (not a const) so tests can redirect it instead of touching the
+// real /etc; production code never reassigns it.
+var etcConfigPath = "/etc/peekastokk/config"
+
 // DefaultPaths returns the candidate config file locations in search order.
 func DefaultPaths() []string {
 	home, _ := os.UserHomeDir()
@@ -103,6 +113,9 @@ func DefaultPaths() []string {
 		paths = append(paths,
 			filepath.Join(home, ".peekastokk"),
 			filepath.Join(home, ".peekastokk", "config"))
+	}
+	if etcConfigPath != "" {
+		paths = append(paths, etcConfigPath)
 	}
 	return paths
 }

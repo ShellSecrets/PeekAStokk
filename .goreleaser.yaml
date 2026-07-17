@@ -29,6 +29,13 @@ archives:
     # No version in the name, so releases/latest/download/<name> always
     # points at the current release's binary (a stable download link).
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    # Setting `files` replaces GoReleaser's default README*/LICENSE* glob,
+    # so list those explicitly alongside config.example (install.sh seeds
+    # /etc/peekastokk/config from it).
+    files:
+      - LICENSE*
+      - README*
+      - config.example
 
 checksum:
   name_template: "checksums.txt"
