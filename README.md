@@ -193,3 +193,10 @@ make test   # go test -race ./...
 make vet
 make build  # embeds the version via -ldflags
 ```
+
+## License
+
+[GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0). In short: you
+may use, modify, and redistribute this software freely, but if you run a
+modified version as a network service, you must offer its source to the
+users of that service.
