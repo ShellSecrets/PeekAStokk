@@ -7,6 +7,14 @@ error/warning highlighting.
 Written in Go with almost no dependencies — the standard library plus
 `golang.org/x/crypto` (Argon2id password hashing for the optional auth).
 
+## Why PeekAStokk?
+
+As a DevOps engineer working across many companies, developers, and dev
+servers, I kept needing a quick way for developers to check application
+logs — but existing log viewers were either built for production (complex,
+heavy, or costly) or just not made for dev-server simplicity. So I built
+PeekAStokk: simple, lightweight, and easy for developers to use.
+
 ## Quick start
 
 ```sh

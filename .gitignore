@@ -5,3 +5,6 @@
 # Test & coverage output
 *.out
 *.test
+
+# Local Claude Code settings
+/.claude/
