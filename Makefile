@@ -13,7 +13,7 @@ vet:
 	go vet ./...
 
 fmt:
-	gofmt -l -w .
+	gofmt -l -w $$(go list -f '{{.Dir}}' ./...)
 
 clean:
 	rm -f $(BIN)

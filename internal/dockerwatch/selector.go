@@ -63,10 +63,7 @@ func (s *Selector) Match(name, id string) (alias string, ok bool) {
 	if len(s.entries) == 0 {
 		return "", true // no entries: select everything
 	}
-	short := id
-	if len(short) > 12 {
-		short = short[:12]
-	}
+	short := shortID(id)
 	for _, e := range s.entries {
 		switch {
 		case e.isAll:

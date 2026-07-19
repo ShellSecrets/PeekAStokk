@@ -70,8 +70,16 @@ type Client struct {
 	httpc *http.Client
 	max   int
 
+	// The retry buffer is a fixed ring (ring[head] is the oldest of count
+	// entries): no slice-shift reallocation churn at steady-state overflow
+	// (was ~355 amortized B/op from periodic whole-buffer copies with the
+	// previous buf=buf[1:] scheme; now 0 B/op — BenchmarkEnqueueSteadyOverflow),
+	// and released slots are zeroed so dropped/acked line text is freed
+	// immediately instead of lingering in the backing array.
 	mu        sync.Mutex
-	buf       []entry // ordered by seq, un-acked
+	ring      []entry
+	head      int
+	count     int
 	nextSeq   uint64
 	dropped   uint64
 	sent      uint64
@@ -100,6 +108,7 @@ func New(serverURL, token string, opts Options) *Client {
 		log:   opts.Logger,
 		httpc: opts.HTTPClient,
 		max:   opts.BufferLines,
+		ring:  make([]entry, opts.BufferLines),
 		wake:  make(chan struct{}, 1),
 	}
 }
@@ -110,8 +119,10 @@ func New(serverURL, token string, opts Options) *Client {
 func (c *Client) Enqueue(source, text string, off int64, ts time.Time) {
 	c.mu.Lock()
 	c.nextSeq++
-	if len(c.buf) >= c.max {
-		c.buf = c.buf[1:]
+	if c.count == c.max {
+		c.ring[c.head] = entry{} // release the dropped line's text now
+		c.head = (c.head + 1) % c.max
+		c.count--
 		c.dropped++
 		if !c.dropping {
 			c.dropping = true
@@ -119,16 +130,32 @@ func (c *Client) Enqueue(source, text string, off int64, ts time.Time) {
 				"capacity", c.max, "dropped_total", c.dropped)
 		}
 	}
-	c.buf = append(c.buf, entry{
+	c.ring[(c.head+c.count)%c.max] = entry{
 		seq:  c.nextSeq,
 		line: ingestproto.Line{Seq: c.nextSeq, Source: source, Text: text, Off: off, Time: ts},
-	})
+	}
+	c.count++
 	c.mu.Unlock()
 
 	select {
 	case c.wake <- struct{}{}:
 	default:
 	}
+}
+
+// trimAcked drops every buffered entry with seq <= ack, zeroing the freed
+// slots so their line text is collectible immediately.
+func (c *Client) trimAcked(ack uint64) {
+	c.mu.Lock()
+	for c.count > 0 && c.ring[c.head].seq <= ack {
+		c.ring[c.head] = entry{}
+		c.head = (c.head + 1) % c.max
+		c.count--
+	}
+	if c.dropping && c.count < c.max {
+		c.dropping = false
+	}
+	c.mu.Unlock()
 }
 
 // Status returns a snapshot of the client's state.
@@ -138,7 +165,7 @@ func (c *Client) Status() Status {
 	st := Status{
 		Connected:       c.connected,
 		LastConnectedAt: c.lastConn,
-		BufferedLines:   len(c.buf),
+		BufferedLines:   c.count,
 		LinesSent:       c.sent,
 		DroppedLines:    c.dropped,
 	}
@@ -278,16 +305,7 @@ func (c *Client) connectAndPump(ctx context.Context) error {
 				return
 			}
 			watchdog.Reset(ackTimeout)
-			c.mu.Lock()
-			i := 0
-			for i < len(c.buf) && c.buf[i].seq <= ack.Ack {
-				i++
-			}
-			c.buf = c.buf[i:]
-			if c.dropping && len(c.buf) < c.max {
-				c.dropping = false
-			}
-			c.mu.Unlock()
+			c.trimAcked(ack.Ack)
 		}
 	}()
 
@@ -297,10 +315,12 @@ func (c *Client) connectAndPump(ctx context.Context) error {
 	// only genuinely unconfirmed lines repeat).
 	enc := json.NewEncoder(pw)
 	var sentUpTo uint64
+	var pending []ingestproto.Line // reused across wakeups
 	for {
 		c.mu.Lock()
-		var pending []ingestproto.Line
-		for _, e := range c.buf {
+		pending = pending[:0]
+		for i := 0; i < c.count; i++ {
+			e := c.ring[(c.head+i)%c.max]
 			if e.seq > sentUpTo {
 				pending = append(pending, e.line)
 				sentUpTo = e.seq

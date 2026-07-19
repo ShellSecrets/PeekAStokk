@@ -59,13 +59,19 @@ type configV2 struct {
 	Name string `json:"Name"`
 }
 
+// shortID is a container id trimmed to docker ps's familiar 12-character
+// display form.
+func shortID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}
+
 // resolveName returns the container's friendly name, or the short id when
 // the name cannot be resolved.
 func (w *Watcher) resolveName(id string) string {
-	short := id
-	if len(short) > 12 {
-		short = short[:12]
-	}
+	short := shortID(id)
 	data, err := os.ReadFile(filepath.Join(w.root, id, "config.v2.json"))
 	if err != nil {
 		w.noteFallback(id, err)

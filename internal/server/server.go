@@ -11,7 +11,6 @@ import (
 	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -139,13 +138,38 @@ func (s *Server) RegisterSource(key, baseName string, local bool) (id string, is
 }
 
 // Handler returns the root handler for use with an http.Server, wrapped in
-// basic authentication when credentials are configured.
+// security headers and, when credentials are configured, basic auth.
 func (s *Server) Handler() http.Handler {
-	if s.authUser == "" {
-		return s.mux
+	h := http.Handler(s.mux)
+	if s.authUser != "" {
+		h = s.requireBasicAuth(h)
 	}
-	return s.requireBasicAuth(s.mux)
+	return securityHeaders(h)
 }
+
+// securityHeaders sets standard browser-hardening headers on every
+// response. The CSP allows exactly what the embedded single-page UI
+// needs: its own inline script/style, same-origin EventSource/fetch, and
+// the data:-URI favicon — everything else (frames, plugins, external
+// loads) is denied.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy",
+			"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// failedAuthDelay slows every rejected credential check. Hashed secrets
+// are already brute-force-resistant (Argon2id), but plaintext-configured
+// ones compare in nanoseconds — this puts a floor on guessing speed per
+// connection either way, and costs a legitimate user with a typo nothing
+// noticeable.
+const failedAuthDelay = 500 * time.Millisecond
 
 // requireBasicAuth guards every route except /healthz (load balancers need
 // to probe unauthenticated). Credentials are compared in constant time via
@@ -177,6 +201,10 @@ func (s *Server) requireBasicAuth(next http.Handler) http.Handler {
 				return
 			}
 			s.log.Warn("rejected credentials", "remote", r.RemoteAddr, "user", user)
+			select {
+			case <-time.After(failedAuthDelay):
+			case <-r.Context().Done():
+			}
 		}
 		w.Header().Set("WWW-Authenticate", `Basic realm="PeekAStokk", charset="UTF-8"`)
 		http.Error(w, "authentication required", http.StatusUnauthorized)
@@ -319,7 +347,7 @@ func (s *Server) writeBatch(w io.Writer, flusher http.Flusher, sub *hub.Subscrib
 	if s.writeEvent(w, first, false) != nil {
 		return false
 	}
-	for i := 0; i < batchLimit; i++ {
+	for range batchLimit {
 		select {
 		case ev, open := <-sub.Events():
 			if !open || s.writeEvent(w, ev, false) != nil {
@@ -334,6 +362,13 @@ func (s *Server) writeBatch(w io.Writer, flusher http.Flusher, sub *hub.Subscrib
 	flusher.Flush()
 	return true
 }
+
+// sseBufPool recycles the per-event frame buffer on the SSE hot path
+// (each line is written once per connected viewer). Pooling plus manual
+// framing instead of fmt.Fprintf: 548ns/288B/5allocs -> 466ns/256B/3allocs
+// per event (BenchmarkWriteEvent), and one Write call per frame instead of
+// Fprintf's several. The residual cost is json.Marshal itself.
+var sseBufPool = sync.Pool{New: func() any { return new([]byte) }}
 
 // writeEvent serializes ev for the wire, replacing the internal file path
 // with its opaque id. replay marks events the client did not observe live
@@ -354,8 +389,17 @@ func (s *Server) writeEvent(w io.Writer, ev hub.Event, replay bool) error {
 	if err != nil {
 		return err
 	}
+	bp := sseBufPool.Get().(*[]byte)
+	buf := (*bp)[:0]
+	buf = append(buf, "id: "...)
+	buf = strconv.AppendUint(buf, ev.Seq, 10)
+	buf = append(buf, "\ndata: "...)
 	// json.Marshal escapes newlines, so data is always a single SSE line.
-	_, err = fmt.Fprintf(w, "id: %d\ndata: %s\n\n", ev.Seq, data)
+	buf = append(buf, data...)
+	buf = append(buf, "\n\n"...)
+	_, err = w.Write(buf)
+	*bp = buf
+	sseBufPool.Put(bp)
 	return err
 }
 

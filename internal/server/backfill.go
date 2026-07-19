@@ -121,10 +121,7 @@ func readLinesBefore(path string, before int64, limit int) ([]backfillLine, bool
 	var blocks [][]byte
 	pos, newlines := end, 0
 	for pos > 0 && newlines <= limit && end-pos < maxBackfillScan {
-		n := int64(backfillScanBlock)
-		if n > pos {
-			n = pos
-		}
+		n := min(int64(backfillScanBlock), pos)
 		block := make([]byte, n)
 		if _, err := f.ReadAt(block, pos-n); err != nil {
 			return nil, false, fmt.Errorf("read at %d: %w", pos-n, err)

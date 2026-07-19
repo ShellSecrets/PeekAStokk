@@ -95,11 +95,20 @@ func (s *Server) handleIngestCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, ok := s.checkIngestToken(token); !ok {
-		s.log.Warn("rejected ingest token", "remote", r.RemoteAddr)
-		http.Error(w, "invalid token", http.StatusUnauthorized)
+		s.rejectIngest(w, r)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// rejectIngest logs, applies the failed-auth delay, and responds 401.
+func (s *Server) rejectIngest(w http.ResponseWriter, r *http.Request) {
+	s.log.Warn("rejected ingest token", "remote", r.RemoteAddr)
+	select {
+	case <-time.After(failedAuthDelay):
+	case <-r.Context().Done():
+	}
+	http.Error(w, "invalid token", http.StatusUnauthorized)
 }
 
 // handleIngest receives one forwarding client's line stream. The request
@@ -115,8 +124,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	clientName, ok := s.checkIngestToken(token)
 	if !ok {
-		s.log.Warn("rejected ingest token", "remote", r.RemoteAddr)
-		http.Error(w, "invalid token", http.StatusUnauthorized)
+		s.rejectIngest(w, r)
 		return
 	}
 
