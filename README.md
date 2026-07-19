@@ -146,6 +146,81 @@ config file's `file` list entirely.
 | `-auth`           | (off)            | Require HTTP basic auth, `user:password`; empty disables        |
 | `-config`         | (searched)       | Explicit config file path                                       |
 | `-version`        |                  | Print version and exit                                          |
+| `-headless`       | `false`          | No web UI; forward only                                         |
+| `-forward-to`     | (off)            | Push tailed lines to another PeekAStokk (`http(s)://host:port`) |
+| `-forward-token`  |                  | Bearer token for `-forward-to` (from `-generate-token`)         |
+| `-forward-buffer-lines` | `5000`     | Lines buffered in memory while the forward connection is down   |
+| `-status-addr`    | (off)            | Minimal `/healthz` + `/statusz` listener (no log content)       |
+| `-docker`         | `false`          | Tail Docker container logs under `-docker-root`                 |
+| `-docker-root`    | `/var/lib/docker/containers` | Docker containers dir (`docker info --format '{{.DockerRootDir}}'` + `/containers`) |
+| `-docker-poll`    | `2s`             | Containers directory re-scan interval                           |
+| `-docker-containers` | (all)         | Repeatable: exact `name[:alias]`, glob `web-*`, or `*`          |
+| `-generate-token` |                  | Print a new forwarding token + its hash, then exit              |
+
+## Forwarding: Docker containers and remote servers
+
+PeekAStokk forwards logs between its own instances — no syslog, SSH, or
+agents from other ecosystems. One binary, two roles, chosen purely by
+config: a **server** (the viewer you open in a browser) and any number of
+**clients** (headless forwarders running where the logs are).
+
+**1. On the server**, generate a token and add the client identity:
+
+```sh
+peekastokk -generate-token       # prints the token + a ready ingest line
+```
+```ini
+# server config
+ingest = homelab-1:$argon2id$...  ; one line per client, unique names
+```
+
+**2. On each client**, forward local files and/or Docker containers:
+
+```ini
+# client config
+headless      = true              ; no local UI, forward only
+forward-to    = http://central:8844
+forward-token = <token from step 1>
+status-addr   = 127.0.0.1:8845    ; optional /healthz + /statusz
+
+file = /var/log/myapp/app.log     ; plain files work as usual
+
+docker = true                     ; and/or Docker container logs
+docker-root = /var/lib/docker/containers
+docker-containers = nginx-prod:web   ; exact container, shown as "web"
+docker-containers = api-*            ; glob; or "*" for all containers
+```
+
+Forwarded sources appear in the server's file picker as
+`<client-name>/<source>` (e.g. `homelab-1/web`) — the client name comes
+from the server's own `ingest =` line, so a client can never impersonate
+another. Lines stream live; while the connection is down the client
+buffers up to `forward-buffer-lines` in memory (oldest dropped beyond
+that) and redelivers on reconnect — nothing is ever written to disk.
+Docker's json-log format is unwrapped automatically, container names are
+resolved without any Docker socket access, and `*`/glob selections track
+containers starting and stopping.
+
+**Docker access is a read-only bind mount, never the socket.** If the
+client itself runs in a container:
+
+```sh
+docker run -d \
+  -v /var/lib/docker/containers:/var/lib/docker/containers:ro \
+  -v /etc/peekastokk:/etc/peekastokk:ro \
+  your-peekastokk-image
+```
+
+If Docker's data-root was moved (custom `--data-root`, rootless Docker),
+find it with `docker info --format '{{.DockerRootDir}}'` and set
+`docker-root` to that value plus `/containers`.
+
+**Transport security:** the bearer token is sent as-is over plain HTTP —
+between real servers, use a TLS reverse proxy in front of the receiver
+(with request buffering disabled for `/ingest`) or an existing private
+network (VPN/WireGuard). Scrollback on forwarded sources is limited to
+the server's in-memory `history`; the log file on the client's disk is
+not remotely seekable.
 
 ## Endpoints
 
@@ -155,6 +230,7 @@ config file's `file` list entirely.
 | `/events`    | SSE stream of log lines (JSON); `?files=` (repeatable) limits the stream to selected files, `?after=` resumes past a sequence number |
 | `/api/files` | List of tailed files                 |
 | `/api/before`| Older lines read from disk for scrollback (`file`, `offset`, `limit`) — only tailed files are readable |
+| `/ingest`    | Receives forwarded lines from clients (bearer-token auth; only exists when `ingest =` entries are configured) |
 | `/healthz`   | Health check                         |
 
 ## Authentication

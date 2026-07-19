@@ -42,14 +42,16 @@ func New(historySize int) *Hub {
 }
 
 // Publish records one line in the history and delivers it to every
-// subscriber. A subscriber whose buffer is full is evicted (its channel is
-// closed) rather than allowed to stall the producers; an evicted SSE client
+// subscriber, reporting whether the hub accepted it (false once closed —
+// callers relaying for a remote source must not acknowledge such lines).
+// A subscriber whose buffer is full is evicted (its channel is closed)
+// rather than allowed to stall the producers; an evicted SSE client
 // simply reconnects and resumes from its last event ID.
-func (h *Hub) Publish(file, text string, off int64, ts time.Time) {
+func (h *Hub) Publish(file, text string, off int64, ts time.Time) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
-		return
+		return false
 	}
 
 	h.nextSeq++
@@ -77,6 +79,7 @@ func (h *Hub) Publish(file, text string, off int64, ts time.Time) {
 			h.evicted++
 		}
 	}
+	return true
 }
 
 // Subscribe registers a new subscriber whose channel holds up to buffer

@@ -25,6 +25,8 @@ import (
 	"log/slog"
 	"os"
 	"time"
+
+	"github.com/shellsecrets/peekastokk/internal/dockerlog"
 )
 
 // Line is a single log line read from a tailed file.
@@ -302,11 +304,18 @@ func (t *Tailer) flushPending(ctx context.Context, out chan<- Line) error {
 	return err
 }
 
-// emit sends b as-is; callers strip any trailing \r first so that chunks of
-// an oversized split line are never altered mid-line.
+// emit sends b as text, unwrapping a Docker json-file log envelope when b
+// matches that shape (see dockerlog.Unwrap); callers strip any trailing \r
+// first so that chunks of an oversized split line are never altered
+// mid-line. off always refers to the raw line's position in the file and
+// is never adjusted for unwrapping, so scrollback pagination stays correct.
 func (t *Tailer) emit(ctx context.Context, out chan<- Line, b []byte, off int64) error {
+	text := b
+	if unwrapped, ok := dockerlog.Unwrap(b); ok {
+		text = unwrapped
+	}
 	select {
-	case out <- Line{File: t.path, Text: string(b), Offset: off, Time: time.Now()}:
+	case out <- Line{File: t.path, Text: string(text), Offset: off, Time: time.Now()}:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

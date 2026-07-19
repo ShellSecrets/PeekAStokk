@@ -71,3 +71,28 @@ file = ~/logs/app.log
 #file = ~/logs/myapp/
 #file = /var/log/nginx/*.log
 #file = "/var/log/name with spaces.log"
+
+# ---------------------------------------------------------------------------
+# Forwarding (see the "Forwarding" section of the README).
+#
+# SERVER side: accept lines from forwarding clients. One line per client;
+# generate the token + hash with:  peekastokk -generate-token
+#ingest = homelab-1:$argon2id$v=19$m=65536,t=3,p=4$...
+
+# CLIENT side: run headless and push everything tailed here to a central
+# PeekAStokk server.
+#headless      = true
+#forward-to    = http://central:8844
+#forward-token = <plaintext token from -generate-token>
+#forward-buffer-lines = 5000
+#status-addr   = 127.0.0.1:8845   ; optional monitoring: /healthz, /statusz
+
+# Docker container logs (read-only file access, no Docker socket).
+# If data-root was moved: docker info --format '{{.DockerRootDir}}' + "/containers"
+#docker      = true
+#docker-root = /var/lib/docker/containers
+#docker-poll = 2s
+# Repeat docker-containers per selection: exact "name[:alias]" (alias sets
+# the display name), a glob like 'web-*', or * for all (the default).
+#docker-containers = nginx-prod:web
+#docker-containers = api-*

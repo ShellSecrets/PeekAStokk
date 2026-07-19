@@ -115,6 +115,75 @@ below).
 .TP
 .B \-version
 Print the version and exit.
+.TP
+.B \-headless
+Do not serve the web UI; tail and forward only. A pure forwarding client
+sets this together with
+.BR \-forward\-to .
+.TP
+.BI \-forward\-to " url"
+Push every tailed line to another PeekAStokk server's /ingest endpoint
+(http(s)://host:port). Requires
+.BR \-forward\-token .
+While the connection is down, up to
+.B \-forward\-buffer\-lines
+lines (default 5000) are buffered in memory and redelivered on
+reconnect; nothing is written to disk.
+.TP
+.BI \-forward\-token " token"
+Bearer token authenticating this client to the receiving server.
+Generate with
+.B \-generate\-token
+on the server side; the server maps the token to a client name via its
+.I ingest
+configuration entries, and that name prefixes every forwarded source's
+display name.
+.TP
+.BI \-status\-addr " address"
+Serve a minimal monitoring listener (/healthz, /statusz) on this
+address, independent of
+.BR \-headless .
+Exposes connection state and counters, never log content.
+.TP
+.B \-docker
+Tail Docker container logs found under
+.BR \-docker\-root ,
+read-only, with no Docker socket access. Container json-log lines are
+unwrapped automatically and container starts/stops are tracked by
+polling.
+.TP
+.BI \-docker\-root " dir"
+Docker's containers directory. Default
+.IR /var/lib/docker/containers ;
+if the daemon's data-root was moved (custom \-\-data\-root, rootless
+Docker), use the output of
+.I docker info \-\-format '{{.DockerRootDir}}'
+plus
+.IR /containers .
+.TP
+.BI \-docker\-containers " entry"
+Repeatable container selection: an exact name or id (optionally
+.IR name:alias ,
+displaying the container as
+.IR alias ),
+a glob like
+.IR 'web\-*' ,
+or
+.I *
+for all containers (the default when no entries are given). An alias is
+only valid on an exact entry.
+.TP
+.BI \-docker\-poll " duration"
+How often the containers directory is re-scanned. Default:
+.IR 2s .
+.TP
+.B \-generate\-token
+Generate a high-entropy forwarding token: print the plaintext once (for
+the client's
+.BR \-forward\-token )
+and its Argon2id hash (for the server's
+.I ingest
+entry), then exit.
 .SH CONFIGURATION FILE
 Every setting
 .B peekastokk

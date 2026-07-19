@@ -15,7 +15,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -58,6 +57,10 @@ type Options struct {
 	// (produced by peekastokk -hash-password).
 	AuthUser string
 	AuthPass string
+	// IngestTokens maps a forwarding client's server-assigned name to its
+	// bearer token (plaintext or Argon2id hash from -generate-token).
+	// Empty disables the /ingest endpoint entirely.
+	IngestTokens map[string]string
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -65,9 +68,7 @@ type Options struct {
 // Server serves the embedded UI, the event stream, and small JSON APIs.
 type Server struct {
 	hub      *hub.Hub
-	entries  []fileEntry
-	pathByID map[string]string // opaque id -> tailed path (server-side only)
-	idByPath map[string]string
+	reg      *registry
 	lines    int
 	authUser string
 	authPass string // plaintext or argon2id PHC hash
@@ -82,6 +83,8 @@ type Server struct {
 	verifiedPass [sha256.Size]byte
 	verifiedSet  bool
 
+	ingestCreds []*ingestCred
+
 	log *slog.Logger
 	mux *http.ServeMux
 }
@@ -94,31 +97,45 @@ func New(h *hub.Hub, opts Options) *Server {
 	if opts.Lines <= 0 {
 		opts.Lines = 500
 	}
-	files := opts.Files
-	names := displayNames(files)
 	s := &Server{
 		hub:      h,
-		entries:  make([]fileEntry, len(files)),
-		pathByID: make(map[string]string, len(files)),
-		idByPath: make(map[string]string, len(files)),
+		reg:      newRegistry(),
 		lines:    opts.Lines,
 		authUser: opts.AuthUser,
 		authPass: opts.AuthPass,
 		log:      opts.Logger,
 		mux:      http.NewServeMux(),
 	}
-	for i, path := range files {
-		id := strconv.Itoa(i)
-		s.entries[i] = fileEntry{ID: id, Name: names[i]}
-		s.pathByID[id] = path
-		s.idByPath[path] = id
+	names := displayNames(opts.Files)
+	for i, path := range opts.Files {
+		s.reg.register(path, names[i], entryLocal)
 	}
 	s.mux.HandleFunc("GET /{$}", s.handleIndex)
 	s.mux.HandleFunc("GET /events", s.handleEvents)
 	s.mux.HandleFunc("GET /api/files", s.handleFiles)
 	s.mux.HandleFunc("GET /api/before", s.handleBefore)
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+	if len(opts.IngestTokens) > 0 {
+		for name, secret := range opts.IngestTokens {
+			s.ingestCreds = append(s.ingestCreds, &ingestCred{name: name, secret: secret})
+		}
+		s.mux.HandleFunc("POST /ingest", s.handleIngest)
+		s.mux.HandleFunc("GET /ingest", s.handleIngestCheck)
+	}
 	return s
+}
+
+// RegisterSource adds (or finds) the source known by key — a local file
+// path or a forwarded source's virtual key — with the given pre-dedup
+// display name. It is safe for concurrent use and is how sources appear
+// at runtime (a Docker watcher finding a new container, an ingest
+// connection announcing a source).
+func (s *Server) RegisterSource(key, baseName string, local bool) (id string, isNew bool) {
+	kind := entryForwarded
+	if local {
+		kind = entryLocal
+	}
+	return s.reg.register(key, baseName, kind)
 }
 
 // Handler returns the root handler for use with an http.Server, wrapped in
@@ -201,29 +218,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]any{"files": s.entries, "lines": s.lines})
-}
-
-// displayNames maps paths to their base names, numbering duplicates
-// ("app.log #2") so two files from different directories stay
-// distinguishable without revealing those directories.
-func displayNames(paths []string) []string {
-	total := make(map[string]int, len(paths))
-	for _, p := range paths {
-		total[filepath.Base(p)]++
-	}
-	seen := make(map[string]int, len(paths))
-	names := make([]string, len(paths))
-	for i, p := range paths {
-		base := filepath.Base(p)
-		if total[base] > 1 {
-			seen[base]++
-			names[i] = fmt.Sprintf("%s #%d", base, seen[base])
-		} else {
-			names[i] = base
-		}
-	}
-	return names
+	writeJSON(w, map[string]any{"files": s.reg.snapshot(), "lines": s.lines})
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -264,7 +259,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if v == "" {
 				continue
 			}
-			path, known := s.pathByID[v]
+			path, _, known := s.reg.lookupPath(v)
 			if !known {
 				http.Error(w, "unknown file in files filter", http.StatusBadRequest)
 				return
@@ -346,6 +341,7 @@ func (s *Server) writeBatch(w io.Writer, flusher http.Flusher, sub *hub.Subscrib
 // timestamp, since the recorded time is when the server read the line, not
 // when it happened.
 func (s *Server) writeEvent(w io.Writer, ev hub.Event, replay bool) error {
+	id, _ := s.reg.lookupID(ev.File)
 	wire := struct {
 		Seq    uint64    `json:"seq"`
 		File   string    `json:"file"` // opaque id, never the path
@@ -353,7 +349,7 @@ func (s *Server) writeEvent(w io.Writer, ev hub.Event, replay bool) error {
 		Off    int64     `json:"off"`
 		Time   time.Time `json:"time"`
 		Replay bool      `json:"replay,omitempty"`
-	}{ev.Seq, s.idByPath[ev.File], ev.Text, ev.Off, ev.Time, replay}
+	}{ev.Seq, id, ev.Text, ev.Off, ev.Time, replay}
 	data, err := json.Marshal(wire)
 	if err != nil {
 		return err

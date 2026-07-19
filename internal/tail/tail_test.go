@@ -238,6 +238,63 @@ func TestLinesCarryByteOffsets(t *testing.T) {
 	}
 }
 
+func TestDockerJSONLogLinesAreUnwrapped(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "docker.log")
+	appendTo(t, path, "")
+	ch := start(t, path, tail.Options{})
+
+	appendTo(t, path,
+		`{"log":"container says hi\n","stream":"stdout","time":"2026-07-18T11:38:07.475856969Z"}`+"\n"+
+			`{"log":"and again\n","stream":"stderr","time":"2026-07-18T11:38:08.000000000Z"}`+"\n")
+	if got := collect(t, ch, 2); !equal(got, []string{"container says hi", "and again"}) {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestDockerJSONLogOffsetsStayRaw(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "docker.log")
+	appendTo(t, path, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	ch := make(chan tail.Line, 16)
+	go tail.New(path, tail.Options{PollInterval: pollInterval}).Run(ctx, ch)
+
+	line1 := `{"log":"first\n","stream":"stdout","time":"2026-07-18T11:38:07Z"}` + "\n"
+	line2 := `{"log":"second\n","stream":"stdout","time":"2026-07-18T11:38:08Z"}` + "\n"
+	appendTo(t, path, line1+line2)
+
+	want := []struct {
+		text string
+		off  int64
+	}{{"first", 0}, {"second", int64(len(line1))}}
+	for _, w := range want {
+		select {
+		case ln := <-ch:
+			if ln.Text != w.text || ln.Offset != w.off {
+				t.Fatalf("got (%q, %d), want (%q, %d)", ln.Text, ln.Offset, w.text, w.off)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out")
+		}
+	}
+}
+
+func TestMalformedDockerJSONPassesThrough(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "docker.log")
+	appendTo(t, path, "")
+	ch := start(t, path, tail.Options{})
+
+	torn := `{"log":"cut off mid`
+	appendTo(t, path, torn+"\n"+`{"log":"fine\n","stream":"stdout","time":"2026-07-18T11:38:07Z"}`+"\n")
+	got := collect(t, ch, 2)
+	if got[0] != torn || got[1] != "fine" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestOversizedLinesAreSplit(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "app.log")

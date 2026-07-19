@@ -60,12 +60,35 @@ type Config struct {
 	Auth         string // "user:password"; empty means no authentication
 	Files        []string
 
+	// Forwarding (client side): where to push tailed lines, and the
+	// bearer token authenticating this client to that server.
+	ForwardTo          string
+	ForwardToken       string
+	ForwardBufferLines int
+	// Headless suppresses the local web UI entirely (a pure forwarder).
+	Headless bool
+	// StatusAddr, when set, serves a minimal /healthz + /statusz listener
+	// (no log content) independent of Headless.
+	StatusAddr string
+
+	// Docker log discovery (client side).
+	Docker           bool
+	DockerRoot       string
+	DockerPoll       time.Duration
+	DockerContainers []string // exact[:alias], glob, or "*"; repeatable
+
+	// Ingest (server side): client name -> bearer token or Argon2id hash.
+	// Presence of any entry enables the /ingest endpoint.
+	Ingest map[string]string
+
 	present map[string]bool
 }
 
 // Has reports whether key appeared in the file. Keys match the flag names:
 // "addr", "port", "history", "lines", "poll", "tail-bytes",
-// "max-line-bytes", "log-level", "auth", "file".
+// "max-line-bytes", "log-level", "auth", "file", "forward-to",
+// "forward-token", "forward-buffer-lines", "headless", "status-addr",
+// "docker", "docker-root", "docker-poll", "docker-containers", "ingest".
 func (c *Config) Has(key string) bool { return c.present[key] }
 
 // Load reads the configuration from explicitPath or, when it is empty, from
@@ -148,7 +171,7 @@ func parse(text, baseDir string) (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("line %d: %w", lineNo, err)
 		}
-		if key != "file" && c.present[key] {
+		if key != "file" && key != "docker-containers" && key != "ingest" && c.present[key] {
 			return nil, fmt.Errorf("line %d: duplicate key %q", lineNo, key)
 		}
 
@@ -195,6 +218,64 @@ func parse(text, baseDir string) (*Config, error) {
 			var p string
 			p, err = resolveFilePath(value, baseDir)
 			c.Files = append(c.Files, p)
+		case "forward-to":
+			if value == "" {
+				err = errors.New("must not be empty")
+			} else if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
+				err = errors.New("must be an http:// or https:// URL")
+			}
+			c.ForwardTo = value
+		case "forward-token":
+			if value == "" {
+				err = errors.New("must not be empty")
+			}
+			c.ForwardToken = value
+		case "forward-buffer-lines":
+			c.ForwardBufferLines, err = strconv.Atoi(value)
+			if err == nil && c.ForwardBufferLines <= 0 {
+				err = errors.New("must be positive")
+			}
+		case "headless":
+			c.Headless, err = strconv.ParseBool(value)
+		case "status-addr":
+			if value == "" {
+				err = errors.New("must not be empty")
+			}
+			c.StatusAddr = value
+		case "docker":
+			c.Docker, err = strconv.ParseBool(value)
+		case "docker-root":
+			if value == "" {
+				err = errors.New("must not be empty")
+			}
+			c.DockerRoot = value
+		case "docker-poll":
+			c.DockerPoll, err = time.ParseDuration(value)
+			if err == nil && c.DockerPoll <= 0 {
+				err = errors.New("must be positive")
+			}
+		case "docker-containers":
+			if value == "" {
+				err = errors.New("must not be empty")
+			}
+			c.DockerContainers = append(c.DockerContainers, value)
+		case "ingest":
+			name, secret, ok := strings.Cut(value, ":")
+			switch {
+			case !ok || name == "" || secret == "":
+				err = errors.New(`must be "name:token-or-hash" with both parts non-empty`)
+			case strings.ContainsAny(name, "/ \t"):
+				err = errors.New("name must not contain '/' or whitespace")
+			default:
+				if c.Ingest == nil {
+					c.Ingest = make(map[string]string)
+				}
+				if _, dup := c.Ingest[name]; dup {
+					err = fmt.Errorf("duplicate ingest name %q", name)
+				} else {
+					c.Ingest[name] = secret
+				}
+			}
 		default:
 			return nil, fmt.Errorf("line %d: unknown key %q", lineNo, key)
 		}

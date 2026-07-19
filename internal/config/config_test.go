@@ -146,6 +146,85 @@ func TestLoadAuth(t *testing.T) {
 	}
 }
 
+func TestLoadForwardingAndDockerKeys(t *testing.T) {
+	isolateHome(t)
+	path := filepath.Join(t.TempDir(), "config")
+	writeFile(t, path, `
+headless    = true
+status-addr = 127.0.0.1:9911
+forward-to  = https://central:8844
+forward-token = Zk8h3nExampleToken
+forward-buffer-lines = 9000
+
+docker      = true
+docker-root = /mnt/docker-data/containers
+docker-poll = 5s
+docker-containers = nginx-prod:web
+docker-containers = api-*
+docker-containers = worker
+
+ingest = homelab-1:tok-one
+ingest = office-2:$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$a2V5
+`)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Headless || cfg.StatusAddr != "127.0.0.1:9911" {
+		t.Errorf("Headless=%v StatusAddr=%q", cfg.Headless, cfg.StatusAddr)
+	}
+	if cfg.ForwardTo != "https://central:8844" || cfg.ForwardToken != "Zk8h3nExampleToken" || cfg.ForwardBufferLines != 9000 {
+		t.Errorf("forward = %q %q %d", cfg.ForwardTo, cfg.ForwardToken, cfg.ForwardBufferLines)
+	}
+	if !cfg.Docker || cfg.DockerRoot != "/mnt/docker-data/containers" || cfg.DockerPoll != 5*time.Second {
+		t.Errorf("docker = %v %q %v", cfg.Docker, cfg.DockerRoot, cfg.DockerPoll)
+	}
+	wantContainers := []string{"nginx-prod:web", "api-*", "worker"}
+	if len(cfg.DockerContainers) != 3 {
+		t.Fatalf("DockerContainers = %v", cfg.DockerContainers)
+	}
+	for i, w := range wantContainers {
+		if cfg.DockerContainers[i] != w {
+			t.Errorf("DockerContainers[%d] = %q, want %q", i, cfg.DockerContainers[i], w)
+		}
+	}
+	if len(cfg.Ingest) != 2 || cfg.Ingest["homelab-1"] != "tok-one" {
+		t.Errorf("Ingest = %v", cfg.Ingest)
+	}
+	for _, key := range []string{"headless", "status-addr", "forward-to", "forward-token", "docker", "docker-containers", "ingest"} {
+		if !cfg.Has(key) {
+			t.Errorf("Has(%q) = false", key)
+		}
+	}
+}
+
+func TestLoadRejectsBadForwardingKeys(t *testing.T) {
+	isolateHome(t)
+	for name, content := range map[string]string{
+		"forward-to not a url":  "forward-to = central:8844\n",
+		"empty forward-token":   "forward-token =\n",
+		"bad headless":          "headless = maybe\n",
+		"bad docker":            "docker = 2\n",
+		"zero docker-poll":      "docker-poll = 0s\n",
+		"empty docker-root":     "docker-root =\n",
+		"ingest missing colon":  "ingest = homelab1\n",
+		"ingest empty token":    "ingest = homelab-1:\n",
+		"ingest name has slash": "ingest = home/lab:tok\n",
+		"ingest name has space": `ingest = "home lab:tok"` + "\n",
+		"ingest duplicate name": "ingest = a:t1\ningest = a:t2\n",
+		"neg buffer lines":      "forward-buffer-lines = -5\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config")
+			writeFile(t, path, content)
+			if _, err := config.Load(path); err == nil {
+				t.Fatalf("expected error for %q", content)
+			}
+		})
+	}
+}
+
 func TestDuplicateFileKeyIsAllowed(t *testing.T) {
 	isolateHome(t)
 	path := filepath.Join(t.TempDir(), "config")

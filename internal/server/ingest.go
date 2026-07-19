@@ -1,0 +1,242 @@
+package server
+
+import (
+	"bufio"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/shellsecrets/peekastokk/internal/auth"
+	"github.com/shellsecrets/peekastokk/internal/ingestproto"
+)
+
+const (
+	// maxSourcesPerClient caps how many distinct sources one forwarding
+	// client may register, so a misbehaving client cannot grow the
+	// registry unboundedly — same spirit as main's maxTailedFiles.
+	maxSourcesPerClient = 500
+	// ackInterval is how often the server reports the highest received
+	// Seq back to the client; short enough that the client's bounded
+	// retry buffer trims promptly under load.
+	ackInterval = 1 * time.Second
+)
+
+// ingestCred is one configured "ingest = name:token-or-hash" identity.
+// The verified-token digest is cached per credential so an Argon2id hash
+// is verified at most once per process per token, mirroring the viewer
+// auth's checkHashedPassword pattern.
+type ingestCred struct {
+	name   string
+	secret string // plaintext token or argon2id PHC hash
+
+	mu       sync.Mutex
+	verified [sha256.Size]byte
+	cached   bool
+}
+
+// check reports whether token matches this credential.
+func (c *ingestCred) check(token string) bool {
+	digest := sha256.Sum256([]byte(token))
+
+	c.mu.Lock()
+	cached, ok := c.verified, c.cached
+	c.mu.Unlock()
+	if ok && subtle.ConstantTimeCompare(digest[:], cached[:]) == 1 {
+		return true
+	}
+
+	var match bool
+	if auth.IsHash(c.secret) {
+		got, err := auth.VerifyPassword(token, c.secret)
+		match = err == nil && got
+	} else {
+		want := sha256.Sum256([]byte(c.secret))
+		match = subtle.ConstantTimeCompare(digest[:], want[:]) == 1
+	}
+	if match {
+		c.mu.Lock()
+		c.verified, c.cached = digest, true
+		c.mu.Unlock()
+	}
+	return match
+}
+
+// checkIngestToken resolves a bearer token to the client name it
+// authenticates as.
+func (s *Server) checkIngestToken(token string) (string, bool) {
+	for _, c := range s.ingestCreds {
+		if c.check(token) {
+			return c.name, true
+		}
+	}
+	return "", false
+}
+
+// forwardKey is the registry key for a forwarded source. It can never
+// collide with a local file's key: local keys are filesystem paths.
+func forwardKey(clientName, source string) string {
+	return "forward:" + clientName + "/" + source
+}
+
+// handleIngestCheck is the auth preflight: forwarding clients verify their
+// token with a cheap GET before opening the streaming POST, because an
+// early 401 on a request whose body is an unwritten pipe would otherwise
+// leave the client's transport wedged mid-request.
+func (s *Server) handleIngestCheck(w http.ResponseWriter, r *http.Request) {
+	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok || token == "" {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="PeekAStokk ingest"`)
+		http.Error(w, "bearer token required", http.StatusUnauthorized)
+		return
+	}
+	if _, ok := s.checkIngestToken(token); !ok {
+		s.log.Warn("rejected ingest token", "remote", r.RemoteAddr)
+		http.Error(w, "invalid token", http.StatusUnauthorized)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleIngest receives one forwarding client's line stream. The request
+// body carries NDJSON ingestproto.Lines; the response body carries
+// periodic ingestproto.Acks — the mirror image of /events' heartbeat,
+// over one full-duplex HTTP request.
+func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
+	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok || token == "" {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="PeekAStokk ingest"`)
+		http.Error(w, "bearer token required", http.StatusUnauthorized)
+		return
+	}
+	clientName, ok := s.checkIngestToken(token)
+	if !ok {
+		s.log.Warn("rejected ingest token", "remote", r.RemoteAddr)
+		http.Error(w, "invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	rc := http.NewResponseController(w)
+	if err := rc.EnableFullDuplex(); err != nil {
+		// HTTP/2 is full-duplex already; on HTTP/1.x this should not
+		// fail with the stdlib server.
+		s.log.Debug("EnableFullDuplex unsupported", "error", err)
+	}
+	h := w.Header()
+	h.Set("Content-Type", "application/x-ndjson")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	rc.Flush()
+
+	s.log.Info("ingest client connected", "client", clientName, "remote", r.RemoteAddr)
+	defer s.log.Info("ingest client disconnected", "client", clientName, "remote", r.RemoteAddr)
+
+	// The ack goroutine is the sole writer to w after the header; the
+	// main goroutine only reads the body. The handler must not return
+	// until the goroutine has fully exited, or a final ack write could
+	// race the server's own response teardown.
+	var highestSeq atomic.Uint64
+	ackDone := make(chan struct{})
+	ackExited := make(chan struct{})
+	defer func() {
+		close(ackDone)
+		<-ackExited
+	}()
+	go func() {
+		defer close(ackExited)
+		ticker := time.NewTicker(ackInterval)
+		defer ticker.Stop()
+		enc := json.NewEncoder(w)
+		for {
+			select {
+			case <-ackDone:
+				return
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				if enc.Encode(ingestproto.Ack{Ack: highestSeq.Load(), Time: time.Now()}) != nil {
+					return
+				}
+				rc.Flush()
+			}
+		}
+	}()
+
+	// sources this connection has been allowed to publish under; capped
+	// via the registry so reconnecting with fresh names cannot grow it
+	// unboundedly.
+	allowed := make(map[string]string) // source -> registry key
+	capWarned := false
+
+	sc := bufio.NewScanner(r.Body)
+	sc.Buffer(make([]byte, 64*1024), ingestproto.MaxLineBytes)
+	for sc.Scan() {
+		raw := sc.Bytes()
+		if len(raw) == 0 {
+			continue
+		}
+		var ln ingestproto.Line
+		if err := json.Unmarshal(raw, &ln); err != nil {
+			// One corrupt line must not kill an otherwise healthy stream.
+			s.log.Debug("skipping malformed ingest line", "client", clientName, "error", err)
+			continue
+		}
+		if ln.Source == "" {
+			continue
+		}
+		key, ok := allowed[ln.Source]
+		if !ok {
+			key = forwardKey(clientName, ln.Source)
+			if _, exists := s.reg.lookupID(key); !exists && s.reg.countForwarded(clientName) >= maxSourcesPerClient {
+				if !capWarned {
+					capWarned = true
+					s.log.Warn("ingest client exceeded source cap; ignoring further new sources",
+						"client", clientName, "cap", maxSourcesPerClient)
+				}
+				continue
+			}
+			s.reg.registerForwarded(clientName, key, clientName+"/"+ln.Source)
+			allowed[ln.Source] = key
+		}
+		ts := ln.Time
+		if ts.IsZero() {
+			ts = time.Now()
+		}
+		if !s.hub.Publish(key, ln.Text, ln.Off, ts) {
+			// Hub closed (server shutting down): end the connection
+			// WITHOUT acking this line, so the client keeps it buffered
+			// and redelivers to the next server instance.
+			s.log.Debug("hub closed; ending ingest stream unacked", "client", clientName)
+			return
+		}
+		if ln.Seq > highestSeq.Load() {
+			highestSeq.Store(ln.Seq)
+		}
+	}
+	if err := sc.Err(); err != nil && r.Context().Err() == nil {
+		s.log.Debug("ingest stream ended", "client", clientName, "error", err)
+	}
+}
+
+// registerForwarded records a forwarded source, tracking the per-client
+// count for the source cap.
+func (rg *registry) registerForwarded(clientName, key, baseName string) {
+	if _, isNew := rg.register(key, baseName, entryForwarded); isNew {
+		rg.mu.Lock()
+		rg.forwardCounts[clientName]++
+		rg.mu.Unlock()
+	}
+}
+
+// countForwarded reports how many distinct sources clientName has
+// registered so far.
+func (rg *registry) countForwarded(clientName string) int {
+	rg.mu.RLock()
+	defer rg.mu.RUnlock()
+	return rg.forwardCounts[clientName]
+}

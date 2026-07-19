@@ -118,9 +118,11 @@ func TestCloseShutsDownSubscribers(t *testing.T) {
 		t.Fatal("expected closed channel")
 	}
 
-	h.Publish("app.log", "after close", 0, time.Now()) // must not panic
-	sub.Close()                                        // must not double-close
-	h.Close()                                          // idempotent
+	if h.Publish("app.log", "after close", 0, time.Now()) { // must not panic
+		t.Error("Publish on a closed hub must report false")
+	}
+	sub.Close() // must not double-close
+	h.Close()   // idempotent
 
 	late, history := h.Subscribe(8, 0, nil)
 	if len(history) != 0 {

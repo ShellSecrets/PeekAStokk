@@ -7,6 +7,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -26,9 +28,12 @@ import (
 
 	"github.com/shellsecrets/peekastokk/internal/auth"
 	"github.com/shellsecrets/peekastokk/internal/config"
+	"github.com/shellsecrets/peekastokk/internal/dockerwatch"
+	"github.com/shellsecrets/peekastokk/internal/forward"
 	"github.com/shellsecrets/peekastokk/internal/hub"
 	"github.com/shellsecrets/peekastokk/internal/server"
 	"github.com/shellsecrets/peekastokk/internal/tail"
+	"github.com/shellsecrets/peekastokk/internal/tailgroup"
 )
 
 // version is overridden at build time:
@@ -50,18 +55,30 @@ func main() {
 
 func run() error {
 	var (
-		addr         = flag.String("addr", "127.0.0.1:8844", "HTTP listen address")
-		historySize  = flag.Int("history", 2000, "number of recent lines replayed to newly connected browsers")
-		uiLines      = flag.Int("lines", 500, "default number of lines the web UI keeps on screen (adjustable in the UI)")
-		poll         = flag.Duration("poll", 200*time.Millisecond, "how often tailed files are checked for new data")
-		tailBytes    = flag.Int64("tail-bytes", 64*1024, "maximum bytes of existing content replayed per file at startup (negative starts at end of file)")
-		maxLine      = flag.Int("max-line-bytes", 256*1024, "lines longer than this are split into chunks")
-		logLevel     = flag.String("log-level", "info", "log level: debug, info, warn, or error")
-		authFlag     = flag.String("auth", "", `require HTTP basic auth to view logs, format "user:password" or "user:$argon2id$..." (empty disables; default). Prefer the config file, with a hash from -hash-password`)
-		hashPassword = flag.Bool("hash-password", false, "prompt for a password, print its Argon2id hash for the auth setting, and exit")
-		configPath   = flag.String("config", "", "path to a config file (default: search the standard locations)")
-		showVersion  = flag.Bool("version", false, "print version and exit")
+		addr          = flag.String("addr", "127.0.0.1:8844", "HTTP listen address")
+		historySize   = flag.Int("history", 2000, "number of recent lines replayed to newly connected browsers")
+		uiLines       = flag.Int("lines", 500, "default number of lines the web UI keeps on screen (adjustable in the UI)")
+		poll          = flag.Duration("poll", 200*time.Millisecond, "how often tailed files are checked for new data")
+		tailBytes     = flag.Int64("tail-bytes", 64*1024, "maximum bytes of existing content replayed per file at startup (negative starts at end of file)")
+		maxLine       = flag.Int("max-line-bytes", 256*1024, "lines longer than this are split into chunks")
+		logLevel      = flag.String("log-level", "info", "log level: debug, info, warn, or error")
+		authFlag      = flag.String("auth", "", `require HTTP basic auth to view logs, format "user:password" or "user:$argon2id$..." (empty disables; default). Prefer the config file, with a hash from -hash-password`)
+		hashPassword  = flag.Bool("hash-password", false, "prompt for a password, print its Argon2id hash for the auth setting, and exit")
+		generateToken = flag.Bool("generate-token", false, "generate a forwarding token: print the plaintext once (for the client's forward-token) and its hash (for the server's ingest setting), then exit")
+		configPath    = flag.String("config", "", "path to a config file (default: search the standard locations)")
+		showVersion   = flag.Bool("version", false, "print version and exit")
+
+		headless     = flag.Bool("headless", false, "do not serve the web UI; forward only")
+		statusAddr   = flag.String("status-addr", "", "optional address for a minimal /healthz + /statusz listener (no log content)")
+		forwardTo    = flag.String("forward-to", "", "push tailed lines to this PeekAStokk server (http(s)://host:port); requires -forward-token")
+		forwardToken = flag.String("forward-token", "", "bearer token for -forward-to (from the server operator's -generate-token)")
+		forwardBuf   = flag.Int("forward-buffer-lines", forward.DefaultBufferLines, "lines buffered in memory while the forward connection is down (oldest dropped when full)")
+		dockerOn     = flag.Bool("docker", false, "tail Docker container logs found under -docker-root")
+		dockerRoot   = flag.String("docker-root", dockerwatch.DefaultRoot, "Docker containers directory (docker info --format '{{.DockerRootDir}}' + /containers)")
+		dockerPoll   = flag.Duration("docker-poll", dockerwatch.DefaultPoll, "how often the containers directory is re-scanned")
 	)
+	var dockerContainers multiFlag
+	flag.Var(&dockerContainers, "docker-containers", `container to tail: exact "name[:alias]", a glob like 'web-*', or '*' for all (repeatable; default all)`)
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(),
 			"Usage: peekastokk [flags] [logfile|directory|glob ...]\n\n"+
@@ -81,6 +98,9 @@ func run() error {
 	}
 	if *hashPassword {
 		return runHashPassword()
+	}
+	if *generateToken {
+		return runGenerateToken()
 	}
 
 	cfg, err := config.Load(*configPath)
@@ -130,6 +150,37 @@ func run() error {
 		if !fromCLI["auth"] && cfg.Has("auth") {
 			*authFlag = cfg.Auth
 		}
+		if !fromCLI["headless"] && cfg.Has("headless") {
+			*headless = cfg.Headless
+		}
+		if !fromCLI["status-addr"] && cfg.Has("status-addr") {
+			*statusAddr = cfg.StatusAddr
+		}
+		if !fromCLI["forward-to"] && cfg.Has("forward-to") {
+			*forwardTo = cfg.ForwardTo
+		}
+		if !fromCLI["forward-token"] && cfg.Has("forward-token") {
+			*forwardToken = cfg.ForwardToken
+		}
+		if !fromCLI["forward-buffer-lines"] && cfg.Has("forward-buffer-lines") {
+			*forwardBuf = cfg.ForwardBufferLines
+		}
+		if !fromCLI["docker"] && cfg.Has("docker") {
+			*dockerOn = cfg.Docker
+		}
+		if !fromCLI["docker-root"] && cfg.Has("docker-root") {
+			*dockerRoot = cfg.DockerRoot
+		}
+		if !fromCLI["docker-poll"] && cfg.Has("docker-poll") {
+			*dockerPoll = cfg.DockerPoll
+		}
+		if !fromCLI["docker-containers"] && cfg.Has("docker-containers") {
+			dockerContainers = cfg.DockerContainers
+		}
+	}
+
+	if (*forwardTo == "") != (*forwardToken == "") {
+		return errors.New("forward-to and forward-token must be set together")
 	}
 
 	var authUser, authPass string
@@ -156,44 +207,98 @@ func run() error {
 	if len(args) == 0 && cfg != nil {
 		args = cfg.Files
 	}
-	paths, err := resolvePaths(args, logger)
-	if err != nil {
+	// A pure receiver (only ingest= entries, no local sources) is valid.
+	hasIngest := cfg != nil && len(cfg.Ingest) > 0
+	var paths []string
+	if len(args) > 0 {
+		paths, err = resolvePaths(args, logger)
+		if err != nil {
+			flag.Usage()
+			return err
+		}
+	} else if !*dockerOn && !hasIngest {
 		flag.Usage()
-		return err
+		return errors.New(`at least one log source is required: file arguments, "file =" config entries, docker = true, or (for a receiving server) "ingest =" entries`)
 	}
 	if *uiLines <= 0 {
 		return fmt.Errorf("-lines must be positive, got %d", *uiLines)
 	}
 
-	// Claim the port before starting anything, so a taken port is a clean
-	// startup failure instead of a half-started process.
-	if occupiedBy := portInUse(*addr); occupiedBy != "" {
-		return fmt.Errorf("%s is already in use (something is accepting connections on %s); refusing to start — pick another port", *addr, occupiedBy)
-	}
-	listener, err := net.Listen("tcp", *addr)
-	if err != nil {
-		if errors.Is(err, syscall.EADDRINUSE) {
-			return fmt.Errorf("port check failed: %s is already in use (is another peekastokk or service running there?)", *addr)
+	// Parse the container selector up front so a bad entry fails startup.
+	var dockerSel *dockerwatch.Selector
+	if *dockerOn {
+		if dockerSel, err = dockerwatch.NewSelector(dockerContainers); err != nil {
+			return err
 		}
-		return fmt.Errorf("cannot listen on %s: %w", *addr, err)
+	}
+	if *headless && *forwardTo == "" && !*dockerOn && len(paths) == 0 {
+		logger.Warn("headless with nothing to forward or view — probably a misconfiguration")
+	}
+
+	// Claim ports before starting anything, so a taken port is a clean
+	// startup failure instead of a half-started process. A headless
+	// forwarder deliberately binds no viewer port at all.
+	var listener net.Listener
+	if !*headless {
+		if occupiedBy := portInUse(*addr); occupiedBy != "" {
+			return fmt.Errorf("%s is already in use (something is accepting connections on %s); refusing to start — pick another port", *addr, occupiedBy)
+		}
+		listener, err = net.Listen("tcp", *addr)
+		if err != nil {
+			if errors.Is(err, syscall.EADDRINUSE) {
+				return fmt.Errorf("port check failed: %s is already in use (is another peekastokk or service running there?)", *addr)
+			}
+			return fmt.Errorf("cannot listen on %s: %w", *addr, err)
+		}
+	} else if *forwardTo == "" {
+		logger.Warn("headless without forward-to: lines are tailed and discarded")
+	}
+	var statusListener net.Listener
+	if *statusAddr != "" {
+		if occupiedBy := portInUse(*statusAddr); occupiedBy != "" {
+			return fmt.Errorf("status-addr %s is already in use (something is accepting connections on %s)", *statusAddr, occupiedBy)
+		}
+		if statusListener, err = net.Listen("tcp", *statusAddr); err != nil {
+			return fmt.Errorf("cannot listen on status-addr %s: %w", *statusAddr, err)
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	h := hub.New(*historySize)
+	var h *hub.Hub
+	if !*headless {
+		h = hub.New(*historySize)
+	}
+
+	var fwd *forward.Client
+	if *forwardTo != "" {
+		fwd = forward.New(strings.TrimRight(*forwardTo, "/"), *forwardToken, forward.Options{
+			BufferLines: *forwardBuf,
+			Logger:      logger,
+		})
+		go fwd.Run(ctx)
+	}
+
+	// namer maps tailed paths to the display names used when forwarding
+	// (and when registering Docker containers with the local UI).
+	namer := newSourceNamer()
+	for _, p := range paths {
+		namer.set(p, filepath.Base(p))
+	}
 
 	// All tailers fan into one channel; a single goroutine publishes to the
-	// hub so sequence numbers reflect global arrival order.
+	// hub (and/or forwarder) so sequence numbers reflect arrival order.
 	lines := make(chan tail.Line, lineBuffer)
+	tailOpts := tail.Options{
+		PollInterval: *poll,
+		TailBytes:    *tailBytes,
+		MaxLineBytes: *maxLine,
+		Logger:       logger,
+	}
 	var tailers sync.WaitGroup
 	for _, p := range paths {
-		t := tail.New(p, tail.Options{
-			PollInterval: *poll,
-			TailBytes:    *tailBytes,
-			MaxLineBytes: *maxLine,
-			Logger:       logger,
-		})
+		t := tail.New(p, tailOpts)
 		tailers.Add(1)
 		go func() {
 			defer tailers.Done()
@@ -201,45 +306,115 @@ func run() error {
 		}()
 	}
 
+	var srv *server.Server
+	if !*headless {
+		var ingestTokens map[string]string
+		if cfg != nil {
+			ingestTokens = cfg.Ingest
+		}
+		srv = server.New(h, server.Options{
+			Files:        paths,
+			Lines:        *uiLines,
+			AuthUser:     authUser,
+			AuthPass:     authPass,
+			IngestTokens: ingestTokens,
+			Logger:       logger,
+		})
+	}
+
+	// The Docker watcher re-scans the containers directory and reconciles
+	// a dynamic tailer group; it joins the same WaitGroup as the static
+	// tailers so shutdown ordering is unchanged.
+	if *dockerOn {
+		watcher := dockerwatch.NewWatcher(*dockerRoot, dockerSel, logger)
+		group := tailgroup.NewGroup(ctx, lines, tailOpts)
+		prev := make(map[string]bool)
+		tailers.Add(1)
+		go func() {
+			defer tailers.Done()
+			dockerwatch.Run(ctx, watcher, *dockerPoll, func(cs []dockerwatch.Container) {
+				desired := make([]string, 0, len(cs))
+				current := make(map[string]bool, len(cs))
+				for _, c := range cs {
+					desired = append(desired, c.LogPath)
+					current[c.LogPath] = true
+					namer.set(c.LogPath, c.DisplayName)
+					if srv != nil {
+						srv.RegisterSource(c.LogPath, c.DisplayName, true)
+					}
+				}
+				for p := range prev {
+					if !current[p] {
+						namer.delete(p)
+					}
+				}
+				prev = current
+				group.Reconcile(desired)
+			})
+			group.Stop()
+		}()
+		logger.Info("docker log discovery enabled", "root", *dockerRoot, "poll", *dockerPoll)
+	}
+
 	publisherDone := make(chan struct{})
 	go func() {
 		defer close(publisherDone)
 		for ln := range lines {
-			h.Publish(ln.File, ln.Text, ln.Offset, ln.Time)
+			if h != nil {
+				h.Publish(ln.File, ln.Text, ln.Offset, ln.Time)
+			}
+			if fwd != nil {
+				fwd.Enqueue(namer.name(ln.File), ln.Text, ln.Offset, ln.Time)
+			}
 		}
 	}()
 
-	if authUser != "" {
-		logger.Info("basic authentication enabled", "user", authUser)
-		if !auth.IsHash(authPass) {
-			logger.Warn("auth password is stored in plaintext; generate a hash with: peekastokk -hash-password")
+	serveErr := make(chan error, 2)
+	var httpSrv *http.Server
+	if !*headless {
+		if authUser != "" {
+			logger.Info("basic authentication enabled", "user", authUser)
+			if !auth.IsHash(authPass) {
+				logger.Warn("auth password is stored in plaintext; generate a hash with: peekastokk -hash-password")
+			}
 		}
+		httpSrv = &http.Server{
+			Addr:              *addr,
+			Handler:           srv.Handler(),
+			ReadHeaderTimeout: 5 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			// Read/WriteTimeout are deliberately unset: /events streams
+			// responses and /ingest streams request bodies indefinitely.
+			ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+		}
+		go func() {
+			serveErr <- httpSrv.Serve(listener)
+		}()
+		logger.Info("peekastokk listening",
+			"version", version,
+			"url", fmt.Sprintf("http://%s/", listener.Addr()),
+			"files", paths)
+	} else {
+		logger.Info("peekastokk headless",
+			"version", version,
+			"forward_to", *forwardTo,
+			"files", paths,
+			"docker", *dockerOn)
 	}
-	httpSrv := &http.Server{
-		Addr: *addr,
-		Handler: server.New(h, server.Options{
-			Files:    paths,
-			Lines:    *uiLines,
-			AuthUser: authUser,
-			AuthPass: authPass,
-			Logger:   logger,
-		}).Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		// WriteTimeout is deliberately unset: /events streams indefinitely.
-		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+	var statusSrv *http.Server
+	if statusListener != nil {
+		statusSrv = &http.Server{
+			Handler:           newStatusHandler(logger, fwd),
+			ReadHeaderTimeout: 5 * time.Second,
+			ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+		}
+		go func() {
+			if err := statusSrv.Serve(statusListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Warn("status server stopped", "error", err)
+			}
+		}()
+		logger.Info("status listener up", "addr", statusListener.Addr())
 	}
-
-	serveErr := make(chan error, 1)
-	go func() {
-		serveErr <- httpSrv.Serve(listener)
-	}()
-
-	logger.Info("peekastokk listening",
-		"version", version,
-		"url", fmt.Sprintf("http://%s/", listener.Addr()),
-		"files", paths)
 
 	select {
 	case <-ctx.Done():
@@ -250,18 +425,36 @@ func run() error {
 
 	// Close the hub first: it closes every subscriber channel, which unblocks
 	// the SSE handlers so Shutdown does not have to wait out its deadline.
-	h.Close()
+	if h != nil {
+		h.Close()
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		logger.Warn("graceful shutdown incomplete, forcing close", "error", err)
-		httpSrv.Close()
+	if httpSrv != nil {
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("graceful shutdown incomplete, forcing close", "error", err)
+			httpSrv.Close()
+		}
+	}
+	if statusSrv != nil {
+		statusSrv.Close()
 	}
 
-	// Tailers stop via ctx; then the publisher drains and exits.
+	// Tailers (static and Docker-discovered) stop via ctx; then the
+	// publisher drains and exits.
 	tailers.Wait()
 	close(lines)
 	<-publisherDone
+	return nil
+}
+
+// multiFlag is a repeatable string flag (the stdlib flag package has no
+// built-in for this).
+type multiFlag []string
+
+func (m *multiFlag) String() string { return strings.Join(*m, ", ") }
+func (m *multiFlag) Set(v string) error {
+	*m = append(*m, v)
 	return nil
 }
 
@@ -307,6 +500,32 @@ func runHashPassword() error {
 	}
 	fmt.Println(hash)
 	fmt.Fprintf(os.Stderr, "\nPut this in your config file:\n\n\tauth = youruser:%s\n", hash)
+	return nil
+}
+
+// runGenerateToken creates a high-entropy forwarding token and prints the
+// plaintext (for the client) plus its Argon2id hash (for the server's
+// "ingest = name:hash" line).
+func runGenerateToken() error {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return fmt.Errorf("generating token: %w", err)
+	}
+	token := base64.RawURLEncoding.EncodeToString(raw)
+	hash, err := auth.HashPassword(token)
+	if err != nil {
+		return err
+	}
+	fmt.Println(token)
+	fmt.Fprintf(os.Stderr, `
+Give the first line to the forwarding client (shown only once):
+
+	forward-token = %s
+
+Add this to the receiving server's config, choosing a name for the client:
+
+	ingest = clientname:%s
+`, token, hash)
 	return nil
 }
 

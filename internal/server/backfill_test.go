@@ -1,6 +1,7 @@
 package server_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,9 +10,11 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/shellsecrets/peekastokk/internal/hub"
 	"github.com/shellsecrets/peekastokk/internal/server"
+	"github.com/shellsecrets/peekastokk/internal/tail"
 )
 
 type beforeResponse struct {
@@ -146,6 +149,119 @@ func TestBackfillOnMissingTailedFileIsEmptyAtStart(t *testing.T) {
 	status, body := getBefore(t, ts, url.Values{"file": {"0"}})
 	if status != http.StatusOK || len(body.Lines) != 0 || !body.AtStart {
 		t.Fatalf("got %d %+v", status, body)
+	}
+}
+
+// dockerLine builds one Docker json-file envelope line (with trailing \n).
+func dockerLine(text string) string {
+	return `{"log":"` + text + `\n","stream":"stdout","time":"2026-07-18T11:38:07.475856969Z"}` + "\n"
+}
+
+func TestBackfillUnwrapsDockerJSONLogLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "docker.log")
+	l1, l2, l3 := dockerLine("alpha"), dockerLine("beta"), dockerLine("gamma")
+	if err := os.WriteFile(path, []byte(l1+l2+l3), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(server.New(hub.New(10), server.Options{Files: []string{path}, Lines: 500}).Handler())
+	t.Cleanup(ts.Close)
+
+	status, body := getBefore(t, ts, url.Values{"file": {"0"}})
+	if status != http.StatusOK || len(body.Lines) != 3 {
+		t.Fatalf("got %d, %d lines", status, len(body.Lines))
+	}
+	wantTexts := []string{"alpha", "beta", "gamma"}
+	wantOffs := []int64{0, int64(len(l1)), int64(len(l1) + len(l2))}
+	for i := range body.Lines {
+		if body.Lines[i].Text != wantTexts[i] || body.Lines[i].Off != wantOffs[i] {
+			t.Errorf("lines[%d] = (%q, %d), want (%q, %d)",
+				i, body.Lines[i].Text, body.Lines[i].Off, wantTexts[i], wantOffs[i])
+		}
+	}
+}
+
+func TestBackfillDockerJSONLogPaginatesAcrossPages(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "docker.log")
+	var content string
+	var offs []int64
+	for i := 0; i < 10; i++ {
+		offs = append(offs, int64(len(content)))
+		content += dockerLine(fmt.Sprintf("event-%d", i))
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(server.New(hub.New(10), server.Options{Files: []string{path}, Lines: 500}).Handler())
+	t.Cleanup(ts.Close)
+
+	// Page backwards 3 lines at a time from EOF; every page must be
+	// contiguous and correctly unwrapped.
+	anchor := int64(len(content))
+	seen := 0
+	for {
+		status, body := getBefore(t, ts, url.Values{
+			"file": {"0"}, "offset": {fmt.Sprint(anchor)}, "limit": {"3"},
+		})
+		if status != http.StatusOK {
+			t.Fatalf("status = %d", status)
+		}
+		if len(body.Lines) == 0 {
+			break
+		}
+		for i := len(body.Lines) - 1; i >= 0; i-- {
+			seen++
+			wantIdx := 10 - seen
+			if body.Lines[i].Text != fmt.Sprintf("event-%d", wantIdx) || body.Lines[i].Off != offs[wantIdx] {
+				t.Fatalf("page line = (%q, %d), want (event-%d, %d)",
+					body.Lines[i].Text, body.Lines[i].Off, wantIdx, offs[wantIdx])
+			}
+		}
+		anchor = body.Lines[0].Off
+		if body.AtStart {
+			break
+		}
+	}
+	if seen != 10 {
+		t.Fatalf("paged through %d lines, want 10", seen)
+	}
+}
+
+// TestLiveAndBackfillAgreeOnDockerUnwrap proves the two independent code
+// paths (live tailer, disk backfill) produce identical text for the same
+// docker-json file.
+func TestLiveAndBackfillAgreeOnDockerUnwrap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "docker.log")
+	content := dockerLine("one") + `{"log":"torn` + "\n" + dockerLine("three")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Live path.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := make(chan tail.Line, 16)
+	go tail.New(path, tail.Options{PollInterval: 10 * time.Millisecond}).Run(ctx, ch)
+	var live []string
+	for len(live) < 3 {
+		select {
+		case ln := <-ch:
+			live = append(live, ln.Text)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out, got %q", live)
+		}
+	}
+
+	// Backfill path.
+	ts := httptest.NewServer(server.New(hub.New(10), server.Options{Files: []string{path}, Lines: 500}).Handler())
+	t.Cleanup(ts.Close)
+	status, body := getBefore(t, ts, url.Values{"file": {"0"}})
+	if status != http.StatusOK || len(body.Lines) != 3 {
+		t.Fatalf("backfill got %d, %d lines", status, len(body.Lines))
+	}
+	for i := range live {
+		if body.Lines[i].Text != live[i] {
+			t.Errorf("line %d: backfill %q != live %q", i, body.Lines[i].Text, live[i])
+		}
 	}
 }
 

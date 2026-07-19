@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+
+	"github.com/shellsecrets/peekastokk/internal/dockerlog"
 )
 
 // Backfill serves the UI's scrollback: the browser only holds a bounded
@@ -45,9 +47,15 @@ func (s *Server) handleBefore(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
 	file := q.Get("file")
-	path, known := s.pathByID[file]
+	path, kind, known := s.reg.lookupPath(file)
 	if !known {
 		http.Error(w, "unknown file", http.StatusNotFound)
+		return
+	}
+	if kind == entryForwarded {
+		// A forwarded source has no local file to scroll back into; its
+		// history is whatever the hub ring retains.
+		writeJSON(w, backfillResponse{File: file, Lines: []backfillLine{}, AtStart: true})
 		return
 	}
 
@@ -152,6 +160,11 @@ func readLinesBefore(path string, before int64, limit int) ([]backfillLine, bool
 			break
 		}
 		text := bytes.TrimSuffix(data[:i], []byte{'\r'})
+		// Unwrap before the length cap: unwrapping only ever shrinks, and
+		// this keeps scrollback text identical to the live tailer's.
+		if unwrapped, ok := dockerlog.Unwrap(text); ok {
+			text = unwrapped
+		}
 		if len(text) > maxBackfillLineBytes {
 			text = text[:maxBackfillLineBytes]
 		}
