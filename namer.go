@@ -41,3 +41,18 @@ func (n *sourceNamer) name(path string) string {
 	}
 	return filepath.Base(path)
 }
+
+// pathOf is the reverse lookup: which local file a display name refers
+// to. Used to answer the server's remote scrollback requests — only names
+// this process itself registered ever resolve. Linear scan over a small,
+// bounded set.
+func (n *sourceNamer) pathOf(name string) (string, bool) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	for p, v := range n.names {
+		if v == name {
+			return p, true
+		}
+	}
+	return "", false
+}

@@ -271,20 +271,24 @@ func run() error {
 		h = hub.New(*historySize)
 	}
 
-	var fwd *forward.Client
-	if *forwardTo != "" {
-		fwd = forward.New(strings.TrimRight(*forwardTo, "/"), *forwardToken, forward.Options{
-			BufferLines: *forwardBuf,
-			Logger:      logger,
-		})
-		go fwd.Run(ctx)
-	}
-
 	// namer maps tailed paths to the display names used when forwarding
 	// (and when registering Docker containers with the local UI).
 	namer := newSourceNamer()
 	for _, p := range paths {
 		namer.set(p, filepath.Base(p))
+	}
+
+	var fwd *forward.Client
+	if *forwardTo != "" {
+		fwd = forward.New(strings.TrimRight(*forwardTo, "/"), *forwardToken, forward.Options{
+			BufferLines: *forwardBuf,
+			// The reverse lookup answers the server's remote scrollback
+			// requests from this host's own disk; only sources this
+			// process registered ever resolve.
+			ResolvePath: namer.pathOf,
+			Logger:      logger,
+		})
+		go fwd.Run(ctx)
 	}
 
 	// All tailers fan into one channel; a single goroutine publishes to the

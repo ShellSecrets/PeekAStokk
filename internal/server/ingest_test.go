@@ -188,7 +188,11 @@ func TestIngestSendsAcks(t *testing.T) {
 	}
 }
 
-func TestBackfillShortCircuitsForwardedEntries(t *testing.T) {
+// TestBackfillFallsBackWhenClientDoesNotAnswer: a forwarded entry whose
+// client never responds to the relayed scrollback request degrades to the
+// empty atStart response after the (shortened) timeout.
+func TestBackfillFallsBackWhenClientDoesNotAnswer(t *testing.T) {
+	t.Cleanup(server.SetRemoteBackfillTimeoutForTest(300 * time.Millisecond))
 	h := hub.New(10)
 	ts := newIngestServer(t, h)
 	w, _ := startIngest(t, ts, "sekrit-token")

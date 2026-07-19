@@ -2,8 +2,13 @@ package forward_test
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net"
+	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -144,6 +149,125 @@ func TestForwardReconnectsAfterServerRestart(t *testing.T) {
 		case <-timeout:
 			t.Fatalf("line never delivered after restart: %+v", c.Status())
 		}
+	}
+}
+
+// TestRemoteScrollbackEndToEnd: a browser-style /api/before request for a
+// forwarded source is relayed over the live ingest connection to the real
+// client, which reads its own disk and answers — the full remote
+// scrollback path over a real socket.
+func TestRemoteScrollbackEndToEnd(t *testing.T) {
+	// A real file on the "client's" disk with docker-json content, so the
+	// unwrap-consistency guarantee is exercised remotely too.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "remote.log")
+	var content string
+	for i := range 50 {
+		content += fmt.Sprintf(`{"log":"remote event %d\n","stream":"stdout","time":"2026-07-19T06:00:00Z"}`+"\n", i)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := hub.New(100)
+	ts := httptest.NewServer(server.New(h, server.Options{
+		Files:        []string{"seed.log"},
+		Lines:        500,
+		IngestTokens: map[string]string{"client-a": "tok-123"},
+	}).Handler())
+	t.Cleanup(func() {
+		ts.CloseClientConnections()
+		ts.Close()
+	})
+
+	c := forward.New(ts.URL, "tok-123", forward.Options{
+		BufferLines: 100,
+		ResolvePath: func(source string) (string, bool) {
+			if source == "remote-app" {
+				return path, true
+			}
+			return "", false
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	// One live line registers the source on the server.
+	c.Enqueue("remote-app", "live line", int64(len(content)), time.Now())
+
+	// Find the source's opaque id via /api/files.
+	var id string
+	waitFor(t, 10*time.Second, func() bool {
+		resp, err := http.Get(ts.URL + "/api/files")
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		var body struct {
+			Files []struct{ ID, Name string } `json:"files"`
+		}
+		json.NewDecoder(resp.Body).Decode(&body)
+		for _, f := range body.Files {
+			if f.Name == "client-a/remote-app" {
+				id = f.ID
+				return true
+			}
+		}
+		return false
+	}, "forwarded source registration")
+
+	// Scroll back: ask for the 10 lines before offset EOF-ish anchor.
+	resp, err := http.Get(ts.URL + "/api/before?file=" + id + "&limit=10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Lines []struct {
+			Off  int64  `json:"off"`
+			Text string `json:"text"`
+		} `json:"lines"`
+		AtStart bool `json:"atStart"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Lines) != 10 {
+		t.Fatalf("got %d lines, want 10: %+v", len(body.Lines), body)
+	}
+	// Newest 10 of 50, unwrapped from docker-json, oldest first.
+	for i, ln := range body.Lines {
+		want := fmt.Sprintf("remote event %d", 40+i)
+		if ln.Text != want {
+			t.Fatalf("lines[%d] = %q, want %q", i, ln.Text, want)
+		}
+	}
+	if body.AtStart {
+		t.Fatal("atStart should be false with 40 older lines remaining")
+	}
+
+	// Page all the way back to the start using the offset anchors.
+	anchor := body.Lines[0].Off
+	total := 10
+	for !body.AtStart {
+		resp, err := http.Get(fmt.Sprintf("%s/api/before?file=%s&limit=20&offset=%d", ts.URL, id, anchor))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body.Lines = nil
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if len(body.Lines) == 0 {
+			break
+		}
+		total += len(body.Lines)
+		anchor = body.Lines[0].Off
+	}
+	if total != 50 || anchor != 0 {
+		t.Fatalf("paged %d lines to offset %d, want 50 to 0", total, anchor)
 	}
 }
 

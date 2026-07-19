@@ -16,10 +16,12 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shellsecrets/peekastokk/internal/auth"
 	"github.com/shellsecrets/peekastokk/internal/hub"
+	"github.com/shellsecrets/peekastokk/internal/ingestproto"
 )
 
 //go:embed web/index.html
@@ -84,6 +86,14 @@ type Server struct {
 
 	ingestCreds []*ingestCred
 
+	// Live ingest connections (for relaying remote scrollback requests)
+	// and in-flight request correlation.
+	connMu  sync.Mutex
+	conns   map[string]*ingestConn // clientName -> most recent live conn
+	pendMu  sync.Mutex
+	pending map[uint64]chan ingestproto.BackfillResp
+	reqID   atomic.Uint64
+
 	log *slog.Logger
 	mux *http.ServeMux
 }
@@ -102,6 +112,8 @@ func New(h *hub.Hub, opts Options) *Server {
 		lines:    opts.Lines,
 		authUser: opts.AuthUser,
 		authPass: opts.AuthPass,
+		conns:    make(map[string]*ingestConn),
+		pending:  make(map[uint64]chan ingestproto.BackfillResp),
 		log:      opts.Logger,
 		mux:      http.NewServeMux(),
 	}

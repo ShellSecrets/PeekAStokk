@@ -218,9 +218,14 @@ find it with `docker info --format '{{.DockerRootDir}}'` and set
 **Transport security:** the bearer token is sent as-is over plain HTTP —
 between real servers, use a TLS reverse proxy in front of the receiver
 (with request buffering disabled for `/ingest`) or an existing private
-network (VPN/WireGuard). Scrollback on forwarded sources is limited to
-the server's in-memory `history`; the log file on the client's disk is
-not remotely seekable.
+network (VPN/WireGuard).
+
+**Scrollback works on forwarded sources too**: when you scroll up past
+the server's in-memory history, the server relays the read to the owning
+client over its live connection, and the client pages older lines
+straight from its own disk — all the way back to the start of the file,
+nothing stored server-side. A client that is offline (or an older
+version) degrades gracefully to "no further history".
 
 ## Endpoints
 

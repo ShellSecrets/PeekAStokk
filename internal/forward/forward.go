@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/shellsecrets/peekastokk/internal/backfill"
 	"github.com/shellsecrets/peekastokk/internal/ingestproto"
 )
 
@@ -39,6 +40,12 @@ const (
 type Options struct {
 	// BufferLines bounds the retry buffer; zero selects DefaultBufferLines.
 	BufferLines int
+	// ResolvePath maps a source display name back to the local file path
+	// it is tailed from, for answering the server's remote scrollback
+	// requests. Nil disables remote scrollback (requests are refused).
+	// Only sources this client itself configured ever resolve — the
+	// server cannot request arbitrary paths.
+	ResolvePath func(source string) (string, bool)
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
 	// HTTPClient defaults to a client with no overall timeout (the
@@ -64,11 +71,17 @@ type entry struct {
 // Client forwards enqueued lines to one server. Enqueue is safe for
 // concurrent use; Run must be called exactly once.
 type Client struct {
-	url   string // ".../ingest"
-	token string
-	log   *slog.Logger
-	httpc *http.Client
-	max   int
+	url     string // ".../ingest"
+	token   string
+	log     *slog.Logger
+	httpc   *http.Client
+	max     int
+	resolve func(source string) (string, bool)
+
+	// respMu guards the queue of pending backfill-response chunks, sent
+	// interleaved with lines on the same NDJSON stream.
+	respMu    sync.Mutex
+	respQueue []ingestproto.BackfillResp
 
 	// The retry buffer is a fixed ring (ring[head] is the oldest of count
 	// entries): no slice-shift reallocation churn at steady-state overflow
@@ -103,14 +116,76 @@ func New(serverURL, token string, opts Options) *Client {
 		opts.HTTPClient = &http.Client{}
 	}
 	return &Client{
-		url:   serverURL + "/ingest",
-		token: token,
-		log:   opts.Logger,
-		httpc: opts.HTTPClient,
-		max:   opts.BufferLines,
-		ring:  make([]entry, opts.BufferLines),
-		wake:  make(chan struct{}, 1),
+		url:     serverURL + "/ingest",
+		token:   token,
+		log:     opts.Logger,
+		httpc:   opts.HTTPClient,
+		max:     opts.BufferLines,
+		resolve: opts.ResolvePath,
+		ring:    make([]entry, opts.BufferLines),
+		wake:    make(chan struct{}, 1),
 	}
+}
+
+// handleBackfillReq answers one remote scrollback request: resolve the
+// source to a local file, read backwards from disk, and queue the result
+// as chunks small enough to stay under the wire's per-message size cap.
+func (c *Client) handleBackfillReq(req ingestproto.BackfillReq) {
+	refuse := func(reason string) {
+		c.queueResp(ingestproto.BackfillResp{ID: req.ID, Final: true, Err: reason})
+	}
+	if c.resolve == nil {
+		refuse("remote scrollback disabled")
+		return
+	}
+	path, ok := c.resolve(req.Source)
+	if !ok {
+		refuse("unknown source")
+		return
+	}
+	lines, atStart, err := backfill.ReadLinesBefore(path, req.Before, req.Limit)
+	if err != nil {
+		c.log.Debug("backfill read failed", "source", req.Source, "error", err)
+		refuse("read failed")
+		return
+	}
+
+	// Chunk by cumulative text size so one NDJSON message never
+	// approaches ingestproto.MaxLineBytes even for maximum-width lines.
+	const chunkBudget = ingestproto.MaxLineBytes / 4
+	chunk := ingestproto.BackfillResp{ID: req.ID}
+	budget := chunkBudget
+	for _, ln := range lines {
+		if budget-len(ln.Text) < 0 && len(chunk.Lines) > 0 {
+			c.queueResp(chunk)
+			chunk = ingestproto.BackfillResp{ID: req.ID}
+			budget = chunkBudget
+		}
+		chunk.Lines = append(chunk.Lines, ingestproto.BackfillLine{Off: ln.Off, Text: ln.Text})
+		budget -= len(ln.Text) + 32
+	}
+	chunk.AtStart = atStart
+	chunk.Final = true
+	c.queueResp(chunk)
+}
+
+func (c *Client) queueResp(resp ingestproto.BackfillResp) {
+	c.respMu.Lock()
+	c.respQueue = append(c.respQueue, resp)
+	c.respMu.Unlock()
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+}
+
+// takeResps drains the queued response chunks.
+func (c *Client) takeResps() []ingestproto.BackfillResp {
+	c.respMu.Lock()
+	out := c.respQueue
+	c.respQueue = nil
+	c.respMu.Unlock()
+	return out
 }
 
 // Enqueue buffers one line for delivery. When the buffer is full the
@@ -294,7 +369,10 @@ func (c *Client) connectAndPump(ctx context.Context) error {
 	watchdog := time.AfterFunc(ackTimeout, cancel)
 	defer watchdog.Stop()
 
-	// Ack reader: trims the buffer. Sole reader of the response body.
+	// Ack reader: trims the buffer and dispatches remote scrollback
+	// requests. Sole reader of the response body. Backfill reads run in
+	// their own goroutine so a slow disk cannot stall ack processing;
+	// concurrency is bounded by the server's per-connection request queue.
 	ackErr := make(chan error, 1)
 	go func() {
 		dec := json.NewDecoder(resp.Body)
@@ -306,6 +384,9 @@ func (c *Client) connectAndPump(ctx context.Context) error {
 			}
 			watchdog.Reset(ackTimeout)
 			c.trimAcked(ack.Ack)
+			if ack.Req != nil {
+				go c.handleBackfillReq(*ack.Req)
+			}
 		}
 	}()
 
@@ -337,6 +418,16 @@ func (c *Client) connectAndPump(ctx context.Context) error {
 			c.mu.Lock()
 			c.sent += uint64(n)
 			c.mu.Unlock()
+		}
+		// Backfill response chunks share the stream, wrapped so the
+		// server (and, harmlessly, an older server) can tell them apart
+		// from lines.
+		for _, resp := range c.takeResps() {
+			if err := enc.Encode(struct {
+				Resp *ingestproto.BackfillResp `json:"resp"`
+			}{&resp}); err != nil {
+				return fmt.Errorf("writing backfill response: %w", err)
+			}
 		}
 
 		select {

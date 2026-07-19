@@ -1,48 +1,34 @@
 package server
 
 import (
-	"bytes"
 	"errors"
-	"fmt"
 	"io/fs"
 	"net/http"
-	"os"
 	"strconv"
+	"strings"
 
-	"github.com/shellsecrets/peekastokk/internal/dockerlog"
+	"github.com/shellsecrets/peekastokk/internal/backfill"
 )
 
-// Backfill serves the UI's scrollback: the browser only holds a bounded
-// window of lines, and when the user scrolls above it, older lines are read
-// straight from the file on disk — the hub's in-memory history stays small.
-// The anchor is a byte offset (every streamed line carries its own), so
-// pages are gap-free and never overlap.
-const (
-	defaultBackfillLines = 2000
-	maxBackfillLines     = 5000
-	backfillScanBlock    = 64 * 1024
-	// maxBackfillScan bounds how far back one request will scan, so a file
-	// full of enormous lines cannot balloon a response.
-	maxBackfillScan = 16 << 20
-	// maxBackfillLineBytes truncates pathological single lines for display.
-	maxBackfillLineBytes = 256 * 1024
-)
-
-type backfillLine struct {
-	Off  int64  `json:"off"`
-	Text string `json:"text"`
-}
+// Scrollback: the browser only holds a bounded window of lines; when the
+// user scrolls above it, older lines are read from the file on disk — the
+// hub's in-memory history stays small. For a local file the server reads
+// its own disk; for a forwarded source it relays the request to the
+// owning client over the live ingest connection, which reads *its* disk.
+// The anchor is a byte offset (every streamed line carries its own, in
+// the coordinates of the file it came from), so pages are gap-free and
+// never overlap either way.
 
 type backfillResponse struct {
-	File    string         `json:"file"`
-	Lines   []backfillLine `json:"lines"`
-	AtStart bool           `json:"atStart"`
+	File    string          `json:"file"`
+	Lines   []backfill.Line `json:"lines"`
+	AtStart bool            `json:"atStart"`
 }
 
 // handleBefore returns up to limit complete lines that end strictly before
-// byte offset "offset" in the given file, oldest first. Omitting offset (or
-// passing a negative one) anchors at the end of the file. The file is named
-// by its opaque id; only files this server is tailing may be read.
+// byte offset "offset" in the given source, oldest first. Omitting offset
+// (or passing a negative one) anchors at the end. The source is named by
+// its opaque id; only sources this server knows may be read.
 func (s *Server) handleBefore(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
@@ -50,12 +36,6 @@ func (s *Server) handleBefore(w http.ResponseWriter, r *http.Request) {
 	path, kind, known := s.reg.lookupPath(file)
 	if !known {
 		http.Error(w, "unknown file", http.StatusNotFound)
-		return
-	}
-	if kind == entryForwarded {
-		// A forwarded source has no local file to scroll back into; its
-		// history is whatever the hub ring retains.
-		writeJSON(w, backfillResponse{File: file, Lines: []backfillLine{}, AtStart: true})
 		return
 	}
 
@@ -69,21 +49,42 @@ func (s *Server) handleBefore(w http.ResponseWriter, r *http.Request) {
 		before = n
 	}
 
-	limit := defaultBackfillLines
+	limit := backfill.DefaultLines
 	if v := q.Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 {
 			http.Error(w, "invalid limit", http.StatusBadRequest)
 			return
 		}
-		limit = min(n, maxBackfillLines)
+		limit = min(n, backfill.MaxLines)
 	}
 
-	lines, atStart, err := readLinesBefore(path, before, limit)
+	empty := backfillResponse{File: file, Lines: []backfill.Line{}, AtStart: true}
+
+	if kind == entryForwarded {
+		// The file lives on the forwarding client's disk: relay the read
+		// over its live ingest connection. A client that is offline, slow,
+		// or too old to understand the request degrades to "no further
+		// history" — exactly the pre-relay behavior.
+		clientName, source, ok := parseForwardKey(path)
+		if !ok {
+			writeJSON(w, empty)
+			return
+		}
+		lines, atStart, ok := s.requestRemoteBackfill(r, clientName, source, before, limit)
+		if !ok {
+			writeJSON(w, empty)
+			return
+		}
+		writeJSON(w, backfillResponse{File: file, Lines: lines, AtStart: atStart})
+		return
+	}
+
+	lines, atStart, err := backfill.ReadLinesBefore(path, before, limit)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			// Tailed but not created yet: nothing before, by definition.
-			writeJSON(w, backfillResponse{File: file, Lines: []backfillLine{}, AtStart: true})
+			writeJSON(w, empty)
 			return
 		}
 		s.log.Warn("backfill failed", "file", path, "error", err)
@@ -93,88 +94,17 @@ func (s *Server) handleBefore(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, backfillResponse{File: file, Lines: lines, AtStart: atStart})
 }
 
-// readLinesBefore reads backwards from byte offset before (or EOF when
-// negative) and returns up to limit complete lines, oldest first. atStart
-// reports that the first returned line is the first line of the file.
-func readLinesBefore(path string, before int64, limit int) ([]backfillLine, bool, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, false, err
+// parseForwardKey splits a "forward:<client>/<source>" registry key.
+// Client names cannot contain '/' (config-validated), so the first slash
+// is the separator; the source part is opaque and may contain anything.
+func parseForwardKey(key string) (clientName, source string, ok bool) {
+	rest, found := strings.CutPrefix(key, "forward:")
+	if !found {
+		return "", "", false
 	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return nil, false, err
+	clientName, source, found = strings.Cut(rest, "/")
+	if !found || clientName == "" || source == "" {
+		return "", "", false
 	}
-	end := info.Size()
-	if before >= 0 && before < end {
-		end = before
-	}
-	if end == 0 {
-		return []backfillLine{}, true, nil
-	}
-
-	// Scan backwards in blocks until we have seen limit+1 newlines (the
-	// extra one delimits the start of the oldest wanted line), hit the
-	// start of the file, or exhaust the scan budget.
-	var blocks [][]byte
-	pos, newlines := end, 0
-	for pos > 0 && newlines <= limit && end-pos < maxBackfillScan {
-		n := min(int64(backfillScanBlock), pos)
-		block := make([]byte, n)
-		if _, err := f.ReadAt(block, pos-n); err != nil {
-			return nil, false, fmt.Errorf("read at %d: %w", pos-n, err)
-		}
-		pos -= n
-		newlines += bytes.Count(block, []byte{'\n'})
-		blocks = append(blocks, block)
-	}
-	data := make([]byte, 0, end-pos)
-	for i := len(blocks) - 1; i >= 0; i-- {
-		data = append(data, blocks[i]...)
-	}
-
-	// data covers [pos, end). Unless we reached the start of the file, the
-	// head is mid-line: drop through the first newline.
-	start := pos
-	if pos > 0 {
-		i := bytes.IndexByte(data, '\n')
-		if i < 0 {
-			return []backfillLine{}, false, nil // one line larger than the scan budget
-		}
-		data = data[i+1:]
-		start += int64(i + 1)
-	}
-
-	// The region now begins at a line start. Split into complete lines; a
-	// trailing piece without a newline (possible only when anchored at a
-	// file that does not end in one) is an unfinished line — skip it.
-	var lines []backfillLine
-	for len(data) > 0 {
-		i := bytes.IndexByte(data, '\n')
-		if i < 0 {
-			break
-		}
-		text := bytes.TrimSuffix(data[:i], []byte{'\r'})
-		// Unwrap before the length cap: unwrapping only ever shrinks, and
-		// this keeps scrollback text identical to the live tailer's.
-		if unwrapped, ok := dockerlog.Unwrap(text); ok {
-			text = unwrapped
-		}
-		if len(text) > maxBackfillLineBytes {
-			text = text[:maxBackfillLineBytes]
-		}
-		lines = append(lines, backfillLine{Off: start, Text: string(text)})
-		start += int64(i + 1)
-		data = data[i+1:]
-	}
-	if len(lines) > limit {
-		lines = lines[len(lines)-limit:]
-	}
-	if lines == nil {
-		lines = []backfillLine{}
-	}
-	atStart := len(lines) > 0 && lines[0].Off == 0
-	return lines, atStart, nil
+	return clientName, source, true
 }

@@ -30,10 +30,51 @@ type Line struct {
 	Time time.Time `json:"time"`
 }
 
-// Ack is one server→client status line.
+// Ack is one server→client message: a delivery acknowledgment, a remote
+// scrollback request, or both. Old clients that only understand the ack
+// field simply ignore Req (unknown JSON keys are skipped), and a message
+// with no ack progress carries Ack 0, which trims nothing.
 type Ack struct {
 	// Ack is the highest client Seq handed to the hub so far on this
 	// connection.
-	Ack  uint64    `json:"ack"`
-	Time time.Time `json:"time"`
+	Ack uint64 `json:"ack,omitempty"`
+	// Req asks the client to read older lines from one of its sources'
+	// files on disk (the server has no local copy of forwarded logs).
+	Req  *BackfillReq `json:"req,omitempty"`
+	Time time.Time    `json:"time"`
+}
+
+// BackfillReq is a server→client remote scrollback request.
+type BackfillReq struct {
+	ID     uint64 `json:"id"`     // correlates the response chunks
+	Source string `json:"source"` // the client's own name for the source
+	Before int64  `json:"before"` // byte offset to read strictly before; <0 = EOF
+	Limit  int    `json:"limit"`
+}
+
+// BackfillResp is one client→server response chunk for a BackfillReq. A
+// response may span several chunks (each stays under MaxLineBytes on the
+// wire); Final marks the last one. It travels on the same NDJSON stream
+// as Lines, wrapped as {"resp":{...}} — old servers decode that as a Line
+// with an empty Source and skip it.
+type BackfillResp struct {
+	ID      uint64         `json:"id"`
+	Lines   []BackfillLine `json:"lines,omitempty"`
+	AtStart bool           `json:"at_start,omitempty"`
+	Final   bool           `json:"final,omitempty"`
+	Err     string         `json:"err,omitempty"` // e.g. source unknown to the client
+}
+
+// BackfillLine mirrors backfill.Line without importing it.
+type BackfillLine struct {
+	Off  int64  `json:"off"`
+	Text string `json:"text"`
+}
+
+// Up is the server-side decode envelope for one client→server NDJSON
+// message: either a bare Line (the normal case, fields at top level) or a
+// wrapped backfill response.
+type Up struct {
+	Line
+	Resp *BackfillResp `json:"resp,omitempty"`
 }
