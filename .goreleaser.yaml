@@ -8,7 +8,7 @@ before:
 
 builds:
   - id: peekastokk
-    main: ./main.go
+    main: .
     binary: peekastokk
     goos:
       - linux
