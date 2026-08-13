@@ -29,6 +29,10 @@ lines = 500
 # How often tailed files are checked for new data.
 poll = 200ms
 
+# How often directory and glob arguments are re-scanned, picking up log
+# files created or deleted later. 0 disables: expand once at startup.
+#rescan = 60s
+
 # Max bytes of existing content replayed per file at startup.
 # Negative starts at the end of the file (no replay).
 tail-bytes = 65536

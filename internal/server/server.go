@@ -149,6 +149,14 @@ func (s *Server) RegisterSource(key, baseName string, local bool) (id string, is
 	return s.reg.register(key, baseName, kind)
 }
 
+// UnregisterSource hides the source known by key from the file list. Its
+// id stays reserved and a later RegisterSource with the same key revives
+// it, so a browser's ids stay valid across a file being deleted and
+// recreated.
+func (s *Server) UnregisterSource(key string) {
+	s.reg.remove(key)
+}
+
 // Handler returns the root handler for use with an http.Server, wrapped in
 // security headers and, when credentials are configured, basic auth.
 func (s *Server) Handler() http.Handler {
@@ -323,6 +331,16 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	s.log.Debug("sse client connected", "remote", r.RemoteAddr, "after_seq", afterSeq)
 	defer s.log.Debug("sse client disconnected", "remote", r.RemoteAddr)
+
+	// Greeting comment: guarantees a first byte on connect even when the
+	// selected files are quiet and there is no history to replay. Some
+	// browsers only fire the EventSource open event on the first chunk
+	// (not the headers), which otherwise left the UI saying "connecting"
+	// until the first heartbeat; it also gives buffering intermediaries
+	// something to flush immediately.
+	if _, err := io.WriteString(w, ": hello\n\n"); err != nil {
+		return
+	}
 
 	for _, ev := range history {
 		if s.writeEvent(w, ev, true) != nil {

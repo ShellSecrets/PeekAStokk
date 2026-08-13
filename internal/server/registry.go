@@ -30,6 +30,7 @@ type registry struct {
 	pathByID      map[string]string // opaque id -> key (path or virtual key)
 	idByPath      map[string]string
 	kindByID      map[string]entryKind
+	removedByID   map[string]bool // hidden from snapshots; id stays reserved
 	nextID        int
 	forwardCounts map[string]int // clientName -> distinct forwarded sources
 }
@@ -39,6 +40,7 @@ func newRegistry() *registry {
 		pathByID:      make(map[string]string),
 		idByPath:      make(map[string]string),
 		kindByID:      make(map[string]entryKind),
+		removedByID:   make(map[string]bool),
 		forwardCounts: make(map[string]int),
 	}
 }
@@ -52,6 +54,9 @@ func (rg *registry) register(key, baseName string, kind entryKind) (id string, i
 	defer rg.mu.Unlock()
 
 	if id, ok := rg.idByPath[key]; ok {
+		// A re-appearing source (a deleted log file recreated) revives
+		// its old id, so browsers holding it see the same source again.
+		delete(rg.removedByID, id)
 		return id, false
 	}
 	id = strconv.Itoa(rg.nextID)
@@ -68,13 +73,30 @@ func (rg *registry) register(key, baseName string, kind entryKind) (id string, i
 	return id, true
 }
 
-// snapshot returns a copy of the entries for JSON responses.
+// snapshot returns a copy of the entries for JSON responses, without the
+// removed ones.
 func (rg *registry) snapshot() []fileEntry {
 	rg.mu.RLock()
 	defer rg.mu.RUnlock()
-	out := make([]fileEntry, len(rg.entries))
-	copy(out, rg.entries)
+	out := make([]fileEntry, 0, len(rg.entries))
+	for _, e := range rg.entries {
+		if rg.removedByID[e.ID] {
+			continue
+		}
+		out = append(out, e)
+	}
 	return out
+}
+
+// remove hides key's entry from snapshots without releasing its id: an id
+// handed to a browser must never point at a different source, and the
+// same key re-registering gets it back. Unknown keys are a no-op.
+func (rg *registry) remove(key string) {
+	rg.mu.Lock()
+	defer rg.mu.Unlock()
+	if id, ok := rg.idByPath[key]; ok {
+		rg.removedByID[id] = true
+	}
 }
 
 // lookupPath resolves an opaque id to its key and kind.

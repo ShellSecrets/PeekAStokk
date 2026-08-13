@@ -399,7 +399,10 @@ function setActive(f) {
 }
 
 function visibleFiles() {
-  return [...files.values()].filter((f) => !f.itemEl.hidden);
+  // DOM order, not registration order: the list is re-sorted on open so
+  // arrow-key navigation must follow what is on screen.
+  const byEl = new Map([...files.values()].map((f) => [f.itemEl, f]));
+  return [...fileListEl.children].map((el) => byEl.get(el)).filter((f) => f && !f.itemEl.hidden);
 }
 
 function moveActive(delta) {
@@ -408,6 +411,15 @@ function moveActive(delta) {
   const i = vis.indexOf(activeFile);
   if (i === -1) setActive(delta > 0 ? vis[0] : vis[vis.length - 1]);
   else setActive(vis[(i + delta + vis.length) % vis.length]);
+}
+
+// Selected files sort to the top of the dropdown, both groups keeping
+// their registration order. Applied when the menu opens (not on toggle,
+// so rows don't jump around under the cursor mid-selection).
+function sortFileList() {
+  const all = [...files.values()];
+  for (const f of all.filter((f) => f.enabled)) fileListEl.appendChild(f.itemEl);
+  for (const f of all.filter((f) => !f.enabled)) fileListEl.appendChild(f.itemEl);
 }
 
 function filterFileList() {
@@ -426,6 +438,7 @@ function openFileMenu() {
   fileMenu.hidden = false;
   fileBtn.classList.add("open");
   fileSearch.value = "";
+  sortFileList();
   filterFileList();
   fileSearch.focus();
 }
@@ -827,6 +840,41 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+// refreshFiles re-syncs the dropdown with the server, which re-scans
+// directory/glob arguments and Docker containers at runtime: new files
+// get a chip, files the server dropped lose theirs (unless still enabled
+// — lines on screen stay readable until deselected, and the chip goes on
+// the next poll after that), and dedup renames ("app.log" becoming
+// "app.log #1") are picked up.
+async function refreshFiles() {
+  const d = await (await fetch("/api/files")).json();
+  const entries = d.files || [];
+  const listed = new Set(entries.map((e) => e.id));
+  // Files discovered mid-session start deselected (an empty restore set
+  // makes ensureFile default to off), never auto-streaming.
+  initialSelection = new Set();
+  for (const entry of entries) {
+    const f = files.get(entry.id);
+    if (!f) {
+      ensureFile(entry.id, entry.name);
+      continue;
+    }
+    if (entry.name && entry.name !== f.name) {
+      f.name = entry.name;
+      f.itemEl.title = entry.name;
+      f.itemEl.querySelector(".fname").textContent = entry.name;
+    }
+  }
+  initialSelection = null;
+  for (const [id, f] of files) {
+    if (listed.has(id) || f.enabled) continue;
+    if (activeFile === f) setActive(null);
+    f.itemEl.remove();
+    files.delete(id);
+  }
+  updateFileButton();
+}
+
 // Register the file chips before opening the stream, so "the first file"
 // is deterministically the first one on the command line / in the config
 // (not whichever file happens to log first). Also pick up the server's
@@ -854,6 +902,7 @@ async function init() {
   }
   connect();
   updateHud();
+  setInterval(() => { refreshFiles().catch(() => {}); }, 5000);
 }
 init();
 </script>
