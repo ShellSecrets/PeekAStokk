@@ -43,6 +43,7 @@ addr      = 0.0.0.0:9000
 history   = 5000
 lines     = 750
 poll      = 100ms
+rescan    = 5s
 tail_bytes = -1            # underscores and trailing comments are fine
 max-line-bytes = 1024
 log-level = "debug"
@@ -61,6 +62,9 @@ file = ~/logs/api.log
 	}
 	if cfg.History != 5000 || cfg.Poll != 100*time.Millisecond {
 		t.Errorf("History = %d, Poll = %v", cfg.History, cfg.Poll)
+	}
+	if cfg.Rescan != 5*time.Second || !cfg.Has("rescan") {
+		t.Errorf("Rescan = %v", cfg.Rescan)
 	}
 	if cfg.Lines != 750 || !cfg.Has("lines") {
 		t.Errorf("Lines = %d", cfg.Lines)
@@ -111,6 +115,7 @@ func TestLoadRejectsBadInput(t *testing.T) {
 		"bad history":      "history = -1\n",
 		"bad lines":        "lines = 0\n",
 		"bad poll":         "poll = fast\n",
+		"negative rescan":  "rescan = -1s\n",
 		"bad log level":    "log-level = loud\n",
 		"auth no colon":    "auth = devonly\n",
 		"auth empty user":  "auth = :pass\n",

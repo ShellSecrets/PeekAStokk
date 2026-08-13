@@ -190,3 +190,76 @@ func TestResolvePathsCapsFileCount(t *testing.T) {
 		t.Fatalf("expected cap error, got %v", err)
 	}
 }
+
+func TestSplitWatchArgs(t *testing.T) {
+	dir := t.TempDir()
+	plainFile := filepath.Join(dir, "app.log")
+	write(t, plainFile)
+	missing := filepath.Join(dir, "not-yet.log") // plain path that may appear later
+	glob := filepath.Join(dir, "*.log")
+
+	plain, watch := splitWatchArgs([]string{plainFile, dir, glob, missing})
+	if len(plain) != 2 || plain[0] != plainFile || plain[1] != missing {
+		t.Errorf("plain = %v", plain)
+	}
+	if len(watch) != 2 || watch[0] != dir || watch[1] != glob {
+		t.Errorf("watch = %v", watch)
+	}
+}
+
+func TestScanWatchArgsTracksCreationAndDeletion(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.log")
+	write(t, a)
+
+	if got := names(scanWatchArgs([]string{dir}, nil, maxTailedFiles, quiet)); len(got) != 1 || got[0] != "a.log" {
+		t.Fatalf("initial scan = %v", got)
+	}
+
+	b := filepath.Join(dir, "b.log")
+	write(t, b)
+	if got := names(scanWatchArgs([]string{dir}, nil, maxTailedFiles, quiet)); len(got) != 2 {
+		t.Fatalf("after creation = %v", got)
+	}
+
+	if err := os.Remove(a); err != nil {
+		t.Fatal(err)
+	}
+	if got := names(scanWatchArgs([]string{dir}, nil, maxTailedFiles, quiet)); len(got) != 1 || got[0] != "b.log" {
+		t.Fatalf("after deletion = %v", got)
+	}
+}
+
+func TestScanWatchArgsSkipsExcludedAndDuplicates(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.log")
+	b := filepath.Join(dir, "b.log")
+	write(t, a)
+	write(t, b)
+
+	id, err := pathIdentity(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The directory and the overlapping glob both name b.log; a.log is
+	// already tailed statically.
+	got := scanWatchArgs([]string{dir, filepath.Join(dir, "*.log")},
+		map[string]bool{id: true}, maxTailedFiles, quiet)
+	if len(got) != 1 || got[0] != b {
+		t.Fatalf("scan = %v, want just %s", got, b)
+	}
+}
+
+func TestScanWatchArgsToleratesEmptinessAndCapsAtLimit(t *testing.T) {
+	if got := scanWatchArgs([]string{t.TempDir(), "/nonexistent/*.log"}, nil, maxTailedFiles, quiet); len(got) != 0 {
+		t.Fatalf("empty scan = %v", got)
+	}
+
+	dir := t.TempDir()
+	for _, n := range []string{"a.log", "b.log", "c.log"} {
+		write(t, filepath.Join(dir, n))
+	}
+	if got := scanWatchArgs([]string{dir}, nil, 2, quiet); len(got) != 2 {
+		t.Fatalf("capped scan = %v, want 2 files", got)
+	}
+}

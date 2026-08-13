@@ -27,9 +27,12 @@ go build -o peekastokk .
 ```
 
 Directories expand to the files directly inside them (dot-files and
-subdirectories are skipped); glob patterns expand at startup. A plain path
-that doesn't exist yet is waited for, but an unmatched pattern or empty
-directory is a startup error.
+subdirectories are skipped); glob patterns expand to their matches. Both
+are re-scanned every `-rescan` (default `60s`), so log files created later
+are picked up automatically and deleted ones stop being tailed — no
+restart needed. A plain path that doesn't exist yet is waited for. With
+`-rescan 0` everything expands once at startup instead, and an unmatched
+pattern or empty directory becomes a startup error.
 
 Or install directly:
 
@@ -140,6 +143,7 @@ config file's `file` list entirely.
 | `-history`        | `2000`           | Recent lines replayed to newly connected browsers               |
 | `-lines`          | `500`            | Default lines kept on screen in the UI (adjustable there; a value chosen in the UI sticks per browser) |
 | `-poll`           | `200ms`          | How often files are checked for new data                        |
+| `-rescan`         | `60s`            | How often directory/glob arguments are re-scanned for created or deleted log files (`0` disables) |
 | `-tail-bytes`     | `65536`          | Max bytes of existing content replayed per file at startup; negative starts at the end |
 | `-max-line-bytes` | `262144`         | Lines longer than this are split into chunks                    |
 | `-log-level`      | `info`           | `debug`, `info`, `warn`, or `error`                             |

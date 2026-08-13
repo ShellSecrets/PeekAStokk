@@ -28,8 +28,11 @@ waits for it to be created.
 .TP
 .I directory
 Every regular file directly inside the directory is tailed as its own
-log. Dot-files and subdirectories are skipped (not recursive). An empty
-directory is a startup error.
+log. Dot-files and subdirectories are skipped (not recursive). The
+directory is re-scanned every
+.B \-rescan
+so files created later are picked up and deleted ones stop being tailed;
+with re-scanning disabled, an empty directory is a startup error.
 .TP
 .I glob
 A shell glob pattern such as
@@ -37,7 +40,10 @@ A shell glob pattern such as
 or
 .IR '/var/log/myproject*' .
 Quote it so your shell passes it through unexpanded; matching directories
-are skipped. A pattern that matches nothing is a startup error.
+are skipped. The pattern is re-scanned every
+.B \-rescan
+like a directory; with re-scanning disabled, a pattern that matches
+nothing is a startup error.
 .PP
 If no arguments are given, the files listed as
 .B file
@@ -70,6 +76,15 @@ reloads. Default:
 .BI \-poll " duration"
 How often each tailed file is checked for new data. Default:
 .IR 200ms .
+.TP
+.BI \-rescan " duration"
+How often directory and glob arguments are re-scanned for created or
+deleted log files. A deleted file's tailer stops and its entry leaves
+the file picker; the same file reappearing (log rotation, redeploys)
+revives it.
+.I 0
+disables re-scanning: arguments expand once at startup. Default:
+.IR 60s .
 .TP
 .BI \-tail\-bytes " n"
 Maximum bytes of a file's existing content replayed at startup, aligned
@@ -199,7 +214,7 @@ list entirely rather than merging with it.
 .PP
 Recognized keys:
 .IR addr ", " port " (shorthand for the port half of " addr "), " history ,
-.IR lines ", " poll ", " tail\-bytes ", " max\-line\-bytes ", " log\-level ,
+.IR lines ", " poll ", " rescan ", " tail\-bytes ", " max\-line\-bytes ", " log\-level ,
 .IR auth ", and the repeatable " file .
 Blank lines and lines starting with
 .B #

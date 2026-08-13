@@ -54,6 +54,7 @@ type Config struct {
 	History      int
 	Lines        int
 	Poll         time.Duration
+	Rescan       time.Duration
 	TailBytes    int64
 	MaxLineBytes int
 	LogLevel     string
@@ -85,7 +86,7 @@ type Config struct {
 }
 
 // Has reports whether key appeared in the file. Keys match the flag names:
-// "addr", "port", "history", "lines", "poll", "tail-bytes",
+// "addr", "port", "history", "lines", "poll", "rescan", "tail-bytes",
 // "max-line-bytes", "log-level", "auth", "file", "forward-to",
 // "forward-token", "forward-buffer-lines", "headless", "status-addr",
 // "docker", "docker-root", "docker-poll", "docker-containers", "ingest".
@@ -197,6 +198,11 @@ func parse(text, baseDir string) (*Config, error) {
 			c.Poll, err = time.ParseDuration(value)
 			if err == nil && c.Poll <= 0 {
 				err = errors.New("must be positive")
+			}
+		case "rescan":
+			c.Rescan, err = time.ParseDuration(value)
+			if err == nil && c.Rescan < 0 {
+				err = errors.New("must not be negative (0 disables re-scanning)")
 			}
 		case "tail-bytes":
 			c.TailBytes, err = strconv.ParseInt(value, 10, 64)

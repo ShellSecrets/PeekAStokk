@@ -452,3 +452,61 @@ func TestEventStreamEndsWhenHubCloses(t *testing.T) {
 		t.Fatal("stream did not end after hub close")
 	}
 }
+
+// TestUnregisterHidesEntryAndReRegisterRevivesIt covers the dynamic
+// directory-watching contract: a deleted file disappears from /api/files
+// but keeps its id, and the same path re-registering gets it back.
+func TestUnregisterHidesEntryAndReRegisterRevivesIt(t *testing.T) {
+	srv := server.New(hub.New(10), server.Options{Files: []string{"a.log"}, Lines: 500})
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	list := func() []string {
+		resp, err := http.Get(ts.URL + "/api/files")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var body struct {
+			Files []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"files"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		out := make([]string, len(body.Files))
+		for i, f := range body.Files {
+			out[i] = f.ID + ":" + f.Name
+		}
+		return out
+	}
+
+	id, isNew := srv.RegisterSource("/tmp/w/new.log", "new.log", true)
+	if !isNew {
+		t.Fatalf("RegisterSource reported existing for a new path")
+	}
+	if got := list(); len(got) != 2 || got[1] != id+":new.log" {
+		t.Fatalf("after register: %v", got)
+	}
+
+	srv.UnregisterSource("/tmp/w/new.log")
+	if got := list(); len(got) != 1 || got[0] != "0:a.log" {
+		t.Fatalf("after unregister: %v", got)
+	}
+
+	revived, isNew := srv.RegisterSource("/tmp/w/new.log", "new.log", true)
+	if isNew || revived != id {
+		t.Fatalf("revived id = %q (isNew=%v), want %q", revived, isNew, id)
+	}
+	if got := list(); len(got) != 2 || got[1] != id+":new.log" {
+		t.Fatalf("after revival: %v", got)
+	}
+
+	// Unregistering an unknown key must be a harmless no-op.
+	srv.UnregisterSource("/never/registered")
+	if got := list(); len(got) != 2 {
+		t.Fatalf("after no-op unregister: %v", got)
+	}
+}

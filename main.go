@@ -59,6 +59,7 @@ func run() error {
 		historySize   = flag.Int("history", 2000, "number of recent lines replayed to newly connected browsers")
 		uiLines       = flag.Int("lines", 500, "default number of lines the web UI keeps on screen (adjustable in the UI)")
 		poll          = flag.Duration("poll", 200*time.Millisecond, "how often tailed files are checked for new data")
+		rescan        = flag.Duration("rescan", time.Minute, "how often directory and glob arguments are re-scanned for created or deleted log files (0 disables: expand once at startup)")
 		tailBytes     = flag.Int64("tail-bytes", 64*1024, "maximum bytes of existing content replayed per file at startup (negative starts at end of file)")
 		maxLine       = flag.Int("max-line-bytes", 256*1024, "lines longer than this are split into chunks")
 		logLevel      = flag.String("log-level", "info", "log level: debug, info, warn, or error")
@@ -85,7 +86,8 @@ func run() error {
 				"Tails the given log files and streams them live to a web UI.\n"+
 				"A directory means every file directly inside it; glob patterns\n"+
 				"(e.g. '/var/log/*.log', quoted so the shell passes them through)\n"+
-				"expand at startup.\n"+
+				"expand to their matches. Directories and patterns are re-scanned\n"+
+				"every -rescan, picking up files created or deleted later.\n"+
 				"Files and flag defaults may also come from a config file, searched at:\n\n\t%s\n\nFlags:\n",
 			strings.Join(config.DefaultPaths(), "\n\t"))
 		flag.PrintDefaults()
@@ -135,6 +137,9 @@ func run() error {
 		}
 		if !fromCLI["poll"] && cfg.Has("poll") {
 			*poll = cfg.Poll
+		}
+		if !fromCLI["rescan"] && cfg.Has("rescan") {
+			*rescan = cfg.Rescan
 		}
 		if !fromCLI["tail-bytes"] && cfg.Has("tail-bytes") {
 			*tailBytes = cfg.TailBytes
@@ -209,6 +214,14 @@ func run() error {
 	}
 	// A pure receiver (only ingest= entries, no local sources) is valid.
 	hasIngest := cfg != nil && len(cfg.Ingest) > 0
+	// With re-scanning enabled, directory and glob arguments are watched:
+	// their current files are tailed and the argument is re-expanded every
+	// -rescan so files created or deleted later are picked up. With it
+	// disabled everything expands once at startup, as before.
+	var watchArgs []string
+	if *rescan > 0 {
+		args, watchArgs = splitWatchArgs(args)
+	}
 	var paths []string
 	if len(args) > 0 {
 		paths, err = resolvePaths(args, logger)
@@ -216,9 +229,21 @@ func run() error {
 			flag.Usage()
 			return err
 		}
-	} else if !*dockerOn && !hasIngest {
+	} else if len(watchArgs) == 0 && !*dockerOn && !hasIngest {
 		flag.Usage()
 		return errors.New(`at least one log source is required: file arguments, "file =" config entries, docker = true, or (for a receiving server) "ingest =" entries`)
+	}
+	// staticIDs keeps watched scans from double-tailing a file that is
+	// already tailed via a plain argument.
+	staticIDs := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		if id, idErr := pathIdentity(p); idErr == nil {
+			staticIDs[id] = true
+		}
+	}
+	var dynPaths []string
+	if len(watchArgs) > 0 {
+		dynPaths = scanWatchArgs(watchArgs, staticIDs, maxTailedFiles-len(paths), logger)
 	}
 	if *uiLines <= 0 {
 		return fmt.Errorf("-lines must be positive, got %d", *uiLines)
@@ -317,7 +342,7 @@ func run() error {
 			ingestTokens = cfg.Ingest
 		}
 		srv = server.New(h, server.Options{
-			Files:        paths,
+			Files:        append(append([]string(nil), paths...), dynPaths...),
 			Lines:        *uiLines,
 			AuthUser:     authUser,
 			AuthPass:     authPass,
@@ -358,6 +383,53 @@ func run() error {
 			group.Stop()
 		}()
 		logger.Info("docker log discovery enabled", "root", *dockerRoot, "poll", *dockerPoll)
+	}
+
+	// Watched directory/glob arguments mirror the Docker watcher: re-scan
+	// on a ticker and reconcile a dynamic tailer group. A deleted file's
+	// tailer stops and its UI entry is hidden; the same file reappearing
+	// (log rotation, redeploys) revives both.
+	if len(watchArgs) > 0 {
+		group := tailgroup.NewGroup(ctx, lines, tailOpts)
+		prev := make(map[string]bool)
+		reconcile := func(found []string) {
+			current := make(map[string]bool, len(found))
+			for _, p := range found {
+				current[p] = true
+				namer.set(p, filepath.Base(p))
+				if srv != nil {
+					srv.RegisterSource(p, filepath.Base(p), true)
+				}
+			}
+			for p := range prev {
+				if !current[p] {
+					namer.delete(p)
+					if srv != nil {
+						srv.UnregisterSource(p)
+					}
+				}
+			}
+			prev = current
+			group.Reconcile(found)
+		}
+		limit := maxTailedFiles - len(paths)
+		tailers.Add(1)
+		go func() {
+			defer tailers.Done()
+			defer group.Stop()
+			reconcile(dynPaths)
+			ticker := time.NewTicker(*rescan)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					reconcile(scanWatchArgs(watchArgs, staticIDs, limit, logger))
+				}
+			}
+		}()
+		logger.Info("watching for log file changes", "args", watchArgs, "rescan", *rescan)
 	}
 
 	publisherDone := make(chan struct{})
@@ -618,6 +690,60 @@ func resolvePaths(args []string, logger *slog.Logger) ([]string, error) {
 		return nil, fmt.Errorf("arguments expand to %d files, more than the maximum of %d", len(paths), maxTailedFiles)
 	}
 	return paths, nil
+}
+
+// splitWatchArgs separates arguments naming a changing set of files —
+// directories and glob patterns — from plain file paths. Only used when
+// re-scanning is enabled.
+func splitWatchArgs(args []string) (plain, watch []string) {
+	for _, a := range args {
+		if strings.ContainsAny(a, "*?[") {
+			watch = append(watch, a)
+			continue
+		}
+		if info, err := os.Stat(a); err == nil && info.IsDir() {
+			watch = append(watch, a)
+			continue
+		}
+		plain = append(plain, a)
+	}
+	return plain, watch
+}
+
+// scanWatchArgs expands the watched (directory and glob) arguments into
+// the log files that exist right now, skipping files already tailed via
+// plain arguments and duplicates between watched arguments. Unlike the
+// startup resolution, an argument currently yielding nothing is normal
+// here — files coming and going is the whole point — so it is logged at
+// debug rather than treated as an error.
+func scanWatchArgs(watchArgs []string, exclude map[string]bool, limit int, logger *slog.Logger) []string {
+	seen := make(map[string]bool)
+	var paths []string
+	for _, arg := range watchArgs {
+		expanded, err := expandArg(arg)
+		if err != nil {
+			logger.Debug("watched argument yields no files", "arg", arg, "reason", err)
+			continue
+		}
+		for _, p := range expanded {
+			id, err := pathIdentity(p)
+			if err != nil {
+				logger.Debug("skipping unresolvable path", "file", p, "error", err)
+				continue
+			}
+			if exclude[id] || seen[id] {
+				continue
+			}
+			seen[id] = true
+			paths = append(paths, p)
+		}
+	}
+	if len(paths) > limit {
+		logger.Warn("watched arguments yield more files than the limit; ignoring the extra ones",
+			"found", len(paths), "limit", limit)
+		paths = paths[:limit]
+	}
+	return paths
 }
 
 // pathIdentity returns a canonical form of p for duplicate detection:

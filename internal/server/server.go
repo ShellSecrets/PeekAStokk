@@ -149,6 +149,14 @@ func (s *Server) RegisterSource(key, baseName string, local bool) (id string, is
 	return s.reg.register(key, baseName, kind)
 }
 
+// UnregisterSource hides the source known by key from the file list. Its
+// id stays reserved and a later RegisterSource with the same key revives
+// it, so a browser's ids stay valid across a file being deleted and
+// recreated.
+func (s *Server) UnregisterSource(key string) {
+	s.reg.remove(key)
+}
+
 // Handler returns the root handler for use with an http.Server, wrapped in
 // security headers and, when credentials are configured, basic auth.
 func (s *Server) Handler() http.Handler {
