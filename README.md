@@ -316,6 +316,17 @@ sudo systemctl status peekastokk
 journalctl -u peekastokk -f
 ```
 
+### Behind nginx
+
+To serve PeekAStokk on a public domain with TLS, keep it bound to
+loopback and put nginx in front — a ready-to-adapt config ships as
+[`nginx.example.conf`](nginx.example.conf). The one thing that genuinely
+matters:
+`/events` is a long-lived Server-Sent Events stream and must not be
+buffered, gzipped, cached, or read-timeouted, or the UI hangs on
+"connecting" and lines arrive in bursts. The example handles that, and
+`/ingest` request streaming, per location.
+
 ## Security note
 
 PeekAStokk serves whatever it tails. It binds to `127.0.0.1` by default;
