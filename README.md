@@ -50,7 +50,7 @@ account, and — when systemd is the running init — installs and enables a
 hardened unit:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/shellsecrets/peekastokk/main/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/shellsecrets/peekastokk/master/install.sh | sudo sh
 man peekastokk
 ```
 
