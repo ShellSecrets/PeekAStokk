@@ -399,7 +399,10 @@ function setActive(f) {
 }
 
 function visibleFiles() {
-  return [...files.values()].filter((f) => !f.itemEl.hidden);
+  // DOM order, not registration order: the list is re-sorted on open so
+  // arrow-key navigation must follow what is on screen.
+  const byEl = new Map([...files.values()].map((f) => [f.itemEl, f]));
+  return [...fileListEl.children].map((el) => byEl.get(el)).filter((f) => f && !f.itemEl.hidden);
 }
 
 function moveActive(delta) {
@@ -408,6 +411,15 @@ function moveActive(delta) {
   const i = vis.indexOf(activeFile);
   if (i === -1) setActive(delta > 0 ? vis[0] : vis[vis.length - 1]);
   else setActive(vis[(i + delta + vis.length) % vis.length]);
+}
+
+// Selected files sort to the top of the dropdown, both groups keeping
+// their registration order. Applied when the menu opens (not on toggle,
+// so rows don't jump around under the cursor mid-selection).
+function sortFileList() {
+  const all = [...files.values()];
+  for (const f of all.filter((f) => f.enabled)) fileListEl.appendChild(f.itemEl);
+  for (const f of all.filter((f) => !f.enabled)) fileListEl.appendChild(f.itemEl);
 }
 
 function filterFileList() {
@@ -426,6 +438,7 @@ function openFileMenu() {
   fileMenu.hidden = false;
   fileBtn.classList.add("open");
   fileSearch.value = "";
+  sortFileList();
   filterFileList();
   fileSearch.focus();
 }
