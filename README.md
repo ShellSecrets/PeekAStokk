@@ -43,9 +43,11 @@ go install github.com/shellsecrets/peekastokk@latest
 ### Linux install script (with systemd service)
 
 For a Linux server, `install.sh` detects the CPU (x86/ARM, 32/64-bit),
-downloads the matching [release](#quick-start) binary and its man page to
-`/usr/local`, creates an unprivileged system service account, and — when
-systemd is the running init — installs and enables a hardened unit:
+downloads the matching [release](#quick-start) binary, installs it with its
+man page and docs (README, LICENSE, `config.example` — to
+`/usr/local/share/doc/peekastokk/`), creates an unprivileged system service
+account, and — when systemd is the running init — installs and enables a
+hardened unit:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/shellsecrets/peekastokk/main/install.sh | sudo sh
@@ -56,6 +58,15 @@ On any other init system, only the binary and man page are installed; wire
 the service up to whatever supervises services on that system yourself. See
 [Running as a service](#running-as-a-service) below for the account and
 log-access details.
+
+**Updating:** re-run the exact same command. An existing installation is
+detected and upgraded in place: the binary, man page, and docs are replaced
+(the binary atomically — a running service keeps the old one until restarted),
+while your config, the service account, and the systemd unit are left
+untouched, and a running service is restarted onto the new version. If the
+installed version already matches the latest release, nothing is changed
+(set `PEEKASTOKK_FORCE=1` to reinstall anyway); pin a specific version
+with `PEEKASTOKK_VERSION=v1.2`.
 
 ## Features
 

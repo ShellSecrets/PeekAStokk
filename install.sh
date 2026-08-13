@@ -9,12 +9,21 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/shellsecrets/peekastokk/main/install.sh | sudo sh
 #
+# Updating: re-run the exact same command. An existing installation is
+# detected and upgraded in place — the binary and man page are replaced
+# (atomically, so a running service is unaffected until restart), while
+# the config, service account, and systemd unit are left untouched — and
+# the service, if running, is restarted onto the new binary. When the
+# installed version already matches the requested one, nothing is changed.
+#
 # Environment overrides:
 #   PEEKASTOKK_REPO     "owner/repo" on GitHub (default: shellsecrets/peekastokk)
 #   PEEKASTOKK_VERSION  a release tag to install instead of the latest (e.g. v1.1)
 #   PEEKASTOKK_USER     service account name (default: peekastokk)
 #   PEEKASTOKK_BINDIR   where to install the binary (default: /usr/local/bin)
 #   PEEKASTOKK_MANDIR   where to install the man page (default: /usr/local/share/man/man1)
+#   PEEKASTOKK_DOCDIR   where to install README/LICENSE/config.example (default: /usr/local/share/doc/peekastokk)
+#   PEEKASTOKK_FORCE    set to 1 to reinstall even when the version already matches
 #
 # This script is written for POSIX sh (no bashisms: no arrays, no `[[ ]]`,
 # no `local`) so it runs the same under dash, ash/busybox, and bash.
@@ -27,6 +36,7 @@ SERVICE_USER="${PEEKASTOKK_USER:-peekastokk}"
 BINDIR="${PEEKASTOKK_BINDIR:-/usr/local/bin}"
 BIN_PATH="$BINDIR/peekastokk"
 MANDIR="${PEEKASTOKK_MANDIR:-/usr/local/share/man/man1}"
+DOCDIR="${PEEKASTOKK_DOCDIR:-/usr/local/share/doc/peekastokk}"
 CONFIG_DIR="/etc/peekastokk"
 UNIT_PATH="/etc/systemd/system/peekastokk.service"
 
@@ -121,12 +131,40 @@ fi
 
 tar -xzf "$workdir/$asset" -C "$workdir"
 [ -f "$workdir/peekastokk" ] || err "downloaded archive did not contain a peekastokk binary"
+chmod 0755 "$workdir/peekastokk"
+
+# --- update detection ------------------------------------------------------
+
+# An existing binary means this run is an update: same steps, but the
+# service is restarted onto the new binary at the end, and a matching
+# version short-circuits into a no-op (unless PEEKASTOKK_FORCE=1).
+updating=0
+old_version=""
+if [ -e "$BIN_PATH" ]; then
+	updating=1
+	old_version="$("$BIN_PATH" -version 2>/dev/null || echo unknown)"
+fi
+new_version="$("$workdir/peekastokk" -version 2>/dev/null || echo unknown)"
+
+if [ "$updating" = "1" ] && [ "${PEEKASTOKK_FORCE:-0}" != "1" ] \
+	&& [ "$new_version" != "unknown" ] && [ "$new_version" = "$old_version" ]; then
+	info "already up to date ($old_version); nothing to do. Set PEEKASTOKK_FORCE=1 to reinstall anyway."
+	exit 0
+fi
 
 # --- install the binary --------------------------------------------------
 
+# Install via a temp name + rename: the swap is atomic, and a running
+# service keeps executing the old inode (no ETXTBSY, no truncation race)
+# until it is restarted below.
 mkdir -p "$BINDIR"
-install -m 0755 "$workdir/peekastokk" "$BIN_PATH"
-info "installed $BIN_PATH ($("$BIN_PATH" -version 2>/dev/null || echo unknown))"
+install -m 0755 "$workdir/peekastokk" "$BIN_PATH.new"
+mv -f "$BIN_PATH.new" "$BIN_PATH"
+if [ "$updating" = "1" ]; then
+	info "updated $BIN_PATH ($old_version -> $new_version)"
+else
+	info "installed $BIN_PATH ($new_version)"
+fi
 
 # --- install the man page -------------------------------------------------
 
@@ -143,6 +181,24 @@ if [ -f "$workdir/peekastokk.1" ]; then
 	info "installed man page: $MANDIR/peekastokk.1 (try: man peekastokk)"
 else
 	warn "release archive did not include a man page; skipping"
+fi
+
+# --- docs: README, LICENSE, example config --------------------------------
+
+# Plain overwrites, so an upgrade refreshes them alongside the binary
+# (the same-version early exit above means they only ever lag when the
+# release itself didn't change).
+mkdir -p "$DOCDIR"
+docs_installed=0
+for doc in "$workdir"/README* "$workdir"/LICENSE* "$workdir/config.example"; do
+	[ -f "$doc" ] || continue
+	install -m 0644 "$doc" "$DOCDIR/$(basename "$doc")"
+	docs_installed=$((docs_installed + 1))
+done
+if [ "$docs_installed" -gt 0 ]; then
+	info "installed docs to $DOCDIR"
+else
+	warn "release archive included no README/LICENSE/config.example; skipping docs"
 fi
 
 # --- unprivileged service account -----------------------------------------
@@ -196,8 +252,14 @@ chmod 0640 "$CONFIG_DIR/config"
 # --- systemd unit, only when systemd is the running init -------------------
 
 if [ -d /run/systemd/system ] && have systemctl; then
-	info "systemd detected; installing $UNIT_PATH"
-	cat >"$UNIT_PATH" <<EOF
+	if [ -f "$UNIT_PATH" ]; then
+		# Never rewrite an existing unit: it may carry operator edits
+		# (ports, extra mounts, loosened hardening). Delete it and re-run
+		# to regenerate a pristine one.
+		info "existing $UNIT_PATH kept as-is"
+	else
+		info "systemd detected; installing $UNIT_PATH"
+		cat >"$UNIT_PATH" <<EOF
 [Unit]
 Description=PeekAStokk log viewer
 Documentation=https://github.com/$REPO
@@ -239,21 +301,32 @@ SystemCallErrorNumber=EPERM
 [Install]
 WantedBy=multi-user.target
 EOF
-	systemctl daemon-reload
-	info "unit installed but not started. Next steps:"
-	printf '\n'
-	printf '  1. edit %s and add "file = ..." for each log to tail\n' "$CONFIG_DIR/config"
-	printf "  2. make sure '%s' can read those files — group membership won't cover most\n" "$SERVICE_USER"
-	printf '     app-owned logs; grant access with (repeat per log directory):\n'
-	printf '         setfacl -R -m u:%s:rX /path/to/logs\n' "$SERVICE_USER"
-	printf '         setfacl -R -d -m u:%s:rX /path/to/logs   # applies to future files too\n' "$SERVICE_USER"
-	printf '  3. sudo systemctl enable --now peekastokk\n'
-	printf '  4. journalctl -u peekastokk -f    # "permission denied" here means step 2 is incomplete\n'
-	printf '\n'
+		systemctl daemon-reload
+		info "unit installed but not started. Next steps:"
+		printf '\n'
+		printf '  1. edit %s and add "file = ..." for each log to tail\n' "$CONFIG_DIR/config"
+		printf "  2. make sure '%s' can read those files — group membership won't cover most\n" "$SERVICE_USER"
+		printf '     app-owned logs; grant access with (repeat per log directory):\n'
+		printf '         setfacl -R -m u:%s:rX /path/to/logs\n' "$SERVICE_USER"
+		printf '         setfacl -R -d -m u:%s:rX /path/to/logs   # applies to future files too\n' "$SERVICE_USER"
+		printf '  3. sudo systemctl enable --now peekastokk\n'
+		printf '  4. journalctl -u peekastokk -f    # "permission denied" here means step 2 is incomplete\n'
+		printf '\n'
+	fi
+	# On an update, move a running service onto the new binary; a stopped
+	# or not-yet-enabled service is left alone.
+	if [ "$updating" = "1" ] && systemctl is-active --quiet peekastokk 2>/dev/null; then
+		info "restarting running peekastokk service onto the new binary"
+		systemctl restart peekastokk \
+			|| warn "restart failed; check: journalctl -u peekastokk"
+	fi
 else
+	if [ "$updating" = "1" ]; then
+		warn "restart your peekastokk service yourself so it picks up the new binary."
+	fi
 	warn "systemd not detected as the running init; only the binary was installed."
 	warn "wire up $BIN_PATH to your init system (OpenRC, runit, SysV, ...) yourself, running it as '$SERVICE_USER'; it finds $CONFIG_DIR/config on its own, no extra environment needed."
 	warn "whatever init you use, '$SERVICE_USER' will also need read access granted to any configured log paths (see the README)."
 fi
 
-info "done. binary: $BIN_PATH  man: $MANDIR/peekastokk.1  config: $CONFIG_DIR/config  user: $SERVICE_USER"
+info "done. binary: $BIN_PATH  man: $MANDIR/peekastokk.1  docs: $DOCDIR  config: $CONFIG_DIR/config  user: $SERVICE_USER"
