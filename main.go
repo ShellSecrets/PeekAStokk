@@ -315,7 +315,10 @@ func run() error {
 			// requests from this host's own disk; only sources this
 			// process registered ever resolve.
 			ResolvePath: namer.pathOf,
-			Logger:      logger,
+			// Announced on every (re)connect, so a restarted server lists
+			// this client's quiet files instead of waiting for a line.
+			Sources: namer.all,
+			Logger:  logger,
 		})
 		go fwd.Run(ctx)
 	}
@@ -387,6 +390,9 @@ func run() error {
 						namer.delete(p)
 					}
 				}
+				if fwd != nil && !sameKeys(prev, current) {
+					fwd.SourcesChanged()
+				}
 				prev = current
 				group.Reconcile(desired)
 			})
@@ -420,6 +426,9 @@ func run() error {
 						srv.UnregisterSource(p)
 					}
 				}
+			}
+			if fwd != nil && !sameKeys(prev, current) {
+				fwd.SourcesChanged()
 			}
 			prev = current
 			group.Reconcile(paths)
@@ -795,6 +804,19 @@ func parseLogArgs(args []string) []logArg {
 		out[i] = logArg{spec: spec, alias: alias}
 	}
 	return out
+}
+
+// sameKeys reports whether two path sets hold the same paths.
+func sameKeys(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
 }
 
 // argSpecs returns just the path/pattern of each argument, for logging.

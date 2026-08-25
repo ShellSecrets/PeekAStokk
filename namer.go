@@ -42,6 +42,18 @@ func (n *sourceNamer) name(path string) string {
 	return filepath.Base(path)
 }
 
+// all returns every registered display name, for announcing this client's
+// sources to the server it forwards to.
+func (n *sourceNamer) all() []string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	names := make([]string, 0, len(n.names))
+	for _, v := range n.names {
+		names = append(names, v)
+	}
+	return names
+}
+
 // pathOf is the reverse lookup: which local file a display name refers
 // to. Used to answer the server's remote scrollback requests — only names
 // this process itself registered ever resolve. Linear scan over a small,

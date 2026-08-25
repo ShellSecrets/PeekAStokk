@@ -72,9 +72,21 @@ type BackfillLine struct {
 }
 
 // Up is the server-side decode envelope for one client→server NDJSON
-// message: either a bare Line (the normal case, fields at top level) or a
-// wrapped backfill response.
+// message: a bare Line (the normal case, fields at top level), a wrapped
+// backfill response, or a source announcement.
 type Up struct {
 	Line
 	Resp *BackfillResp `json:"resp,omitempty"`
+	// Sources announces every source this client currently tails, sent on
+	// each connect (and again when the set changes) so a server that has
+	// just restarted knows about quiet files instead of waiting for one
+	// of them to produce a line. Old servers decode it as a Line with an
+	// empty Source and skip it.
+	Sources []string `json:"sources,omitempty"`
+}
+
+// Announce is the client→server source announcement, encoded as
+// {"sources":[...]}.
+type Announce struct {
+	Sources []string `json:"sources"`
 }

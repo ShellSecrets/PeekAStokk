@@ -46,6 +46,10 @@ type Options struct {
 	// Only sources this client itself configured ever resolve — the
 	// server cannot request arbitrary paths.
 	ResolvePath func(source string) (string, bool)
+	// Sources lists every source currently tailed, announced on each
+	// connect so the server knows about quiet files without waiting for
+	// them to produce a line. Nil skips the announcement.
+	Sources func() []string
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
 	// HTTPClient defaults to a client with no overall timeout (the
@@ -77,6 +81,7 @@ type Client struct {
 	httpc   *http.Client
 	max     int
 	resolve func(source string) (string, bool)
+	sources func() []string
 
 	// respMu guards the queue of pending backfill-response chunks, sent
 	// interleaved with lines on the same NDJSON stream.
@@ -97,6 +102,7 @@ type Client struct {
 	dropped   uint64
 	sent      uint64
 	dropping  bool // are we currently in an overflow episode (for log dedup)
+	announce  bool // re-announce the source list on the live connection
 	connected bool
 	lastErr   error
 	lastConn  time.Time
@@ -122,6 +128,7 @@ func New(serverURL, token string, opts Options) *Client {
 		httpc:   opts.HTTPClient,
 		max:     opts.BufferLines,
 		resolve: opts.ResolvePath,
+		sources: opts.Sources,
 		ring:    make([]entry, opts.BufferLines),
 		wake:    make(chan struct{}, 1),
 	}
@@ -212,6 +219,26 @@ func (c *Client) Enqueue(source, text string, off int64, ts time.Time) {
 	c.count++
 	c.mu.Unlock()
 
+	c.wakeWriter()
+}
+
+// SourcesChanged tells the client its set of tailed sources changed (a
+// container started, a watched directory gained or lost a file), so the
+// current list is announced again on the live connection. Safe for
+// concurrent use; a no-op while disconnected, since connecting announces
+// the list anyway.
+func (c *Client) SourcesChanged() {
+	if c.sources == nil {
+		return
+	}
+	c.mu.Lock()
+	c.announce = true
+	c.mu.Unlock()
+	c.wakeWriter()
+}
+
+// wakeWriter nudges the connection's writer loop without blocking.
+func (c *Client) wakeWriter() {
 	select {
 	case c.wake <- struct{}{}:
 	default:
@@ -320,6 +347,22 @@ func (c *Client) preflight(ctx context.Context) error {
 	}
 }
 
+// announceSources sends the current source list, if the caller supplied a
+// way to enumerate it.
+func (c *Client) announceSources(enc *json.Encoder) error {
+	if c.sources == nil {
+		return nil
+	}
+	sources := c.sources()
+	if len(sources) == 0 {
+		return nil
+	}
+	if err := enc.Encode(ingestproto.Announce{Sources: sources}); err != nil {
+		return fmt.Errorf("announcing sources: %w", err)
+	}
+	return nil
+}
+
 // connectAndPump runs one connection to completion: it streams buffered
 // and newly enqueued lines into the request body while reading acks off
 // the response body, trimming the buffer as acks confirm receipt.
@@ -395,9 +438,25 @@ func (c *Client) connectAndPump(ctx context.Context) error {
 	// the server-side UI dedups nothing, but acked lines were trimmed, so
 	// only genuinely unconfirmed lines repeat).
 	enc := json.NewEncoder(pw)
+	// Announce the current sources first: a server that restarted (or is
+	// seeing this client for the first time) then lists every tailed
+	// file right away, including the quiet ones that would otherwise stay
+	// invisible until they happened to be written to.
+	if err := c.announceSources(enc); err != nil {
+		return err
+	}
 	var sentUpTo uint64
 	var pending []ingestproto.Line // reused across wakeups
 	for {
+		c.mu.Lock()
+		reannounce := c.announce
+		c.announce = false
+		c.mu.Unlock()
+		if reannounce {
+			if err := c.announceSources(enc); err != nil {
+				return err
+			}
+		}
 		c.mu.Lock()
 		pending = pending[:0]
 		for i := 0; i < c.count; i++ {

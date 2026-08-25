@@ -243,6 +243,10 @@ from the server's own `ingest =` line, so a client can never impersonate
 another. Lines stream live; while the connection is down the client
 buffers up to `forward-buffer-lines` in memory (oldest dropped beyond
 that) and redelivers on reconnect — nothing is ever written to disk.
+Either side can restart on its own: the client reconnects with backoff
+and re-announces everything it tails, so the server's file picker fills
+back in within a second or two without waiting for a quiet file to be
+written to, and without restarting the client.
 Docker's json-log format is unwrapped automatically, container names are
 resolved without any Docker socket access, and `*`/glob selections track
 containers starting and stopping.

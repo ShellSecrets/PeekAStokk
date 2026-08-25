@@ -298,6 +298,26 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	// unboundedly.
 	allowed := make(map[string]string) // source -> registry key
 	capWarned := false
+	// register resolves a source name to its registry key, registering it
+	// the first time this connection names it. ok is false when the
+	// client is past its source cap.
+	register := func(source string) (string, bool) {
+		if key, ok := allowed[source]; ok {
+			return key, true
+		}
+		key := forwardKey(clientName, source)
+		if _, exists := s.reg.lookupID(key); !exists && s.reg.countForwarded(clientName) >= maxSourcesPerClient {
+			if !capWarned {
+				capWarned = true
+				s.log.Warn("ingest client exceeded source cap; ignoring further new sources",
+					"client", clientName, "cap", maxSourcesPerClient)
+			}
+			return "", false
+		}
+		s.reg.registerForwarded(clientName, key, clientName+"/"+source)
+		allowed[source] = key
+		return key, true
+	}
 
 	sc := bufio.NewScanner(r.Body)
 	sc.Buffer(make([]byte, 64*1024), ingestproto.MaxLineBytes)
@@ -316,23 +336,26 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 			s.routeBackfillResp(up.Resp)
 			continue
 		}
+		if len(up.Sources) > 0 {
+			// The client is announcing what it tails. Registering here
+			// (rather than only on the first line of each source) is what
+			// makes a quiet file reappear in the picker after a server
+			// restart, without waiting for it to be written to.
+			for _, source := range up.Sources {
+				if source == "" {
+					continue
+				}
+				register(source)
+			}
+			continue
+		}
 		ln := up.Line
 		if ln.Source == "" {
 			continue
 		}
-		key, ok := allowed[ln.Source]
+		key, ok := register(ln.Source)
 		if !ok {
-			key = forwardKey(clientName, ln.Source)
-			if _, exists := s.reg.lookupID(key); !exists && s.reg.countForwarded(clientName) >= maxSourcesPerClient {
-				if !capWarned {
-					capWarned = true
-					s.log.Warn("ingest client exceeded source cap; ignoring further new sources",
-						"client", clientName, "cap", maxSourcesPerClient)
-				}
-				continue
-			}
-			s.reg.registerForwarded(clientName, key, clientName+"/"+ln.Source)
-			allowed[ln.Source] = key
+			continue
 		}
 		ts := ln.Time
 		if ts.IsZero() {

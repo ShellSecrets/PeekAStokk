@@ -299,3 +299,65 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool, what string) {
 	}
 	t.Fatalf("timed out waiting for %s", what)
 }
+
+// A server that restarts loses its registry; the client's connection is
+// re-established, but a file that is not being written to would have no
+// reason to send anything. The announced source list is what puts those
+// files back in the picker.
+func TestForwardAnnouncesSourcesWithoutLines(t *testing.T) {
+	ts := httptest.NewServer(server.New(hub.New(100), server.Options{
+		Files:        []string{"seed.log"},
+		Lines:        500,
+		IngestTokens: map[string]string{"client-a": "tok-123"},
+	}).Handler())
+	t.Cleanup(ts.Close)
+
+	c := forward.New(ts.URL, "tok-123", forward.Options{
+		BufferLines: 100,
+		Sources:     func() []string { return []string{"quiet.log", "busy.log"} },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	want := map[string]bool{"client-a/quiet.log": true, "client-a/busy.log": true}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		names := fileNames(t, ts.URL)
+		missing := false
+		for w := range want {
+			if !names[w] {
+				missing = true
+			}
+		}
+		if !missing {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("announced sources never registered; file list = %v, status %+v", names, c.Status())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func fileNames(t *testing.T, baseURL string) map[string]bool {
+	t.Helper()
+	resp, err := http.Get(baseURL + "/api/files")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Files []struct {
+			Name string `json:"name"`
+		} `json:"files"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	names := make(map[string]bool, len(body.Files))
+	for _, f := range body.Files {
+		names[f.Name] = true
+	}
+	return names
+}
