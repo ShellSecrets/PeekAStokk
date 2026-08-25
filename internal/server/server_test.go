@@ -546,3 +546,55 @@ func TestFilesUseNameOverrides(t *testing.T) {
 		}
 	}
 }
+
+// A receiving server with a login on the UI must still accept forwarding
+// clients: they hold a bearer token, never the browser's credentials.
+func TestBasicAuthDoesNotGuardIngest(t *testing.T) {
+	ts := httptest.NewServer(server.New(hub.New(10), server.Options{
+		Files: []string{"a.log"}, Lines: 500,
+		AuthUser: "dev", AuthPass: "s3cret",
+		IngestTokens: map[string]string{"worker-a": "t0ken"},
+	}).Handler())
+	t.Cleanup(ts.Close)
+
+	get := func(path, bearer string) *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+path, nil)
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	// The client's preflight passes on its own token...
+	resp := get("/ingest", "t0ken")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("preflight with token: status = %d, want 204", resp.StatusCode)
+	}
+
+	// ...a wrong or missing token is still rejected, as a bearer...
+	for name, token := range map[string]string{"wrong token": "nope", "no token": ""} {
+		resp := get("/ingest", token)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s: status = %d, want 401", name, resp.StatusCode)
+		}
+		if got := resp.Header.Get("WWW-Authenticate"); !strings.Contains(got, "Bearer") {
+			t.Errorf("%s: WWW-Authenticate = %q, want a Bearer challenge", name, got)
+		}
+	}
+
+	// ...and the log-reading surfaces stay behind the login.
+	for _, path := range []string{"/", "/api/files", "/events"} {
+		resp := get(path, "t0ken")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s with a bearer token: status = %d, want 401", path, resp.StatusCode)
+		}
+	}
+}

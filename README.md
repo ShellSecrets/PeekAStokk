@@ -302,7 +302,9 @@ A plaintext password also works (`auth = dev:s3cret`, or
 startup nudging you toward the hash.
 
 The browser prompts once and everything — UI, live stream, scrollback — is
-protected; `/healthz` stays open for load-balancer probes. `-auth ""` on
+protected; `/healthz` stays open for load-balancer probes, and so does
+`/ingest`, which authenticates forwarding clients by their own bearer
+token instead (a headless forwarder has no browser credentials). `-auth ""` on
 the command line overrides the config back to open access. Credentials are
 compared in constant time, the slow hash verification is cached per process
 and serialized (no CPU-burn from brute-force floods), and rejected attempts

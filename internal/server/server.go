@@ -196,7 +196,10 @@ func securityHeaders(next http.Handler) http.Handler {
 const failedAuthDelay = 500 * time.Millisecond
 
 // requireBasicAuth guards every route except /healthz (load balancers need
-// to probe unauthenticated). Credentials are compared in constant time via
+// to probe unauthenticated) and /ingest (forwarding clients authenticate
+// with their own bearer token, checked against the Argon2id-hashed
+// "ingest =" entries — a browser's basic credentials are not something a
+// headless forwarder has). Credentials are compared in constant time via
 // digests, so neither the comparison nor the length leaks timing.
 func (s *Server) requireBasicAuth(next http.Handler) http.Handler {
 	wantUser := sha256.Sum256([]byte(s.authUser))
@@ -208,6 +211,10 @@ func (s *Server) requireBasicAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
 			next.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path == "/ingest" && len(s.ingestCreds) > 0 {
+			next.ServeHTTP(w, r) // the ingest handlers require a bearer token
 			return
 		}
 		if user, pass, ok := r.BasicAuth(); ok {

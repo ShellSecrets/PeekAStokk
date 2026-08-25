@@ -210,6 +210,11 @@ func (s *Server) rejectIngest(w http.ResponseWriter, r *http.Request) {
 	case <-time.After(failedAuthDelay):
 	case <-r.Context().Done():
 	}
+	// The bearer challenge tells a rejected client (or whoever is
+	// debugging one) that the token reached the ingest route and was
+	// refused there, rather than being stopped by the UI's basic auth or
+	// a proxy in front of it.
+	w.Header().Set("WWW-Authenticate", `Bearer realm="PeekAStokk ingest"`)
 	http.Error(w, "invalid token", http.StatusUnauthorized)
 }
 

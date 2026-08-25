@@ -295,6 +295,15 @@ are never exposed to the client.
 Older lines read backwards from disk for the UI's scrollback, bounded to
 files this process is actually tailing.
 .TP
+.I /ingest
+Receives forwarded lines from clients; exists only when the
+configuration file has
+.B ingest
+entries. Authenticated by the client's own bearer token, so it is not
+behind
+.BR \-auth :
+a headless forwarder has no browser credentials.
+.TP
 .I /healthz
 A liveness probe. Always reachable without authentication, even when
 .B \-auth
