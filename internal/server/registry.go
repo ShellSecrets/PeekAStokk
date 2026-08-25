@@ -138,11 +138,16 @@ func dedupeNames(bases []string) []string {
 	return names
 }
 
-// displayNames maps paths to their deduplicated base names, without
-// revealing the directories they came from.
-func displayNames(paths []string) []string {
+// displayNames maps paths to their deduplicated display names — the
+// alias from overrides when the path has one, otherwise its base name,
+// without revealing the directory it came from.
+func displayNames(paths []string, overrides map[string]string) []string {
 	bases := make([]string, len(paths))
 	for i, p := range paths {
+		if name, ok := overrides[p]; ok && name != "" {
+			bases[i] = name
+			continue
+		}
 		bases[i] = filepath.Base(p)
 	}
 	return dedupeNames(bases)

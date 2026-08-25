@@ -151,7 +151,16 @@
   }
   #maxLines:focus { border-color: var(--accent); }
 
-  #log { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: .35rem 0; }
+  /* Scrollback anchors the viewport itself after every insert, so the
+     browser's own scroll anchoring is turned off rather than left to
+     adjust the same scroll position a second time. */
+  #log {
+    flex: 1;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    overflow-anchor: none;
+    padding: .35rem 0;
+  }
   #older:empty + #live:empty::before {
     content: "Waiting for log lines…";
     display: block;
@@ -310,6 +319,9 @@ let rafScheduled = false;
 // the bottom again frees it all.
 const OLDER_MAX = 6000;   // older lines kept in the DOM before unloading
 const OLDER_PAGE = 2000;  // lines fetched per request per file
+const OLDER_CHUNK = 300;  // older lines inserted per frame while paging in
+const OLDER_TRIGGER = 1200; // px from the top that starts the next page
+const OLDER_PARALLEL = 4; // concurrent /api/before requests
 let olderCount = 0;
 let loadingOlder = false;
 const olderLowest = new Map(); // file -> lowest backfilled offset
@@ -510,35 +522,50 @@ function nearBottom() {
   return logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 48;
 }
 
+// setJumpHidden only touches the DOM on an actual change: an unconditional
+// write here costs a style recalculation on every scrolled frame.
+function setJumpHidden(hidden) {
+  if (jumpBtn.hidden !== hidden) jumpBtn.hidden = hidden;
+}
+
 function scheduleFlush() {
   if (rafScheduled) return;
   rafScheduled = true;
   requestAnimationFrame(() => {
     rafScheduled = false;
+    let atBottom;
     if (pendingNodes.length) {
       // Follow the tail only while no scrollback is open: reading history
       // pauses auto-scroll, otherwise live traffic would keep yanking the
       // view (and freeing the history) underneath the reader.
-      const follow = olderCount === 0 && nearBottom();
+      atBottom = nearBottom();
+      const follow = olderCount === 0 && atBottom;
       const frag = document.createDocumentFragment();
       for (const n of pendingNodes) frag.appendChild(n);
       pendingNodes = [];
       liveEl.appendChild(frag);
       while (liveEl.childElementCount > maxLines) liveEl.firstElementChild.remove();
-      if (follow) programmaticScroll(logEl.scrollHeight);
+      if (follow) {
+        programmaticScroll(logEl.scrollHeight);
+        atBottom = true;
+      } else {
+        atBottom = undefined; // the append moved the bottom; re-measure
+      }
     }
-    updateHud();
+    updateHud(atBottom);
   });
 }
 
-function updateHud() {
+// updateHud takes the caller's bottom measurement when it already made
+// one, so a frame that appended lines does not force a second layout.
+function updateHud(atBottom) {
   for (const f of files.values()) {
     f.countEl.textContent = f.enabled ? f.count.toLocaleString() : "–";
   }
   let stats = `${events.length.toLocaleString()} buffered · ${liveEl.childElementCount.toLocaleString()} shown`;
   if (olderCount > 0) stats += ` · ${olderCount.toLocaleString()} older`;
   statsEl.textContent = stats;
-  jumpBtn.hidden = nearBottom() && olderCount === 0;
+  setJumpHidden((atBottom === undefined ? nearBottom() : atBottom) && olderCount === 0);
 }
 
 function rerender() {
@@ -579,67 +606,108 @@ function anchorFor(id) {
   return liveOldest.get(id); // may be undefined: server then anchors at EOF
 }
 
+// fetchOlder pages one file's next slice of history, or returns null when
+// that file has nothing more to give.
+async function fetchOlder(f) {
+  const q = new URLSearchParams({ file: f.id, limit: String(OLDER_PAGE) });
+  const anchor = anchorFor(f.id);
+  if (anchor !== undefined) q.set("offset", String(anchor));
+  let d;
+  try {
+    const r = await fetch("/api/before?" + q.toString());
+    if (!r.ok) { olderDone.add(f.id); return null; }
+    d = await r.json();
+  } catch { olderDone.add(f.id); return null; }
+  if (d.atStart) olderDone.add(f.id);
+  if (!Array.isArray(d.lines) || d.lines.length === 0) { olderDone.add(f.id); return null; }
+  olderLowest.set(f.id, d.lines[0].off);
+  return { f, lines: d.lines, atStart: !!d.atStart };
+}
+
 async function loadOlder() {
   if (loadingOlder) return;
   const targets = [...files.values()].filter((f) => f.enabled && !olderDone.has(f.id));
   if (!targets.length) return;
   loadingOlder = true;
   try {
+    // The files are fetched together rather than one after another: a
+    // forwarded source's read is relayed to its client, so serializing
+    // them would stack every round trip onto the reader's wait.
     const runs = [];
-    for (const f of targets) {
-      const q = new URLSearchParams({ file: f.id, limit: String(OLDER_PAGE) });
-      const anchor = anchorFor(f.id);
-      if (anchor !== undefined) q.set("offset", String(anchor));
-      let d;
-      try {
-        const r = await fetch("/api/before?" + q.toString());
-        if (!r.ok) { olderDone.add(f.id); continue; }
-        d = await r.json();
-      } catch { olderDone.add(f.id); continue; }
-      if (d.atStart) olderDone.add(f.id);
-      if (!Array.isArray(d.lines) || d.lines.length === 0) { olderDone.add(f.id); continue; }
-      olderLowest.set(f.id, d.lines[0].off);
-      runs.push({ f, lines: d.lines, atStart: !!d.atStart });
+    for (let i = 0; i < targets.length; i += OLDER_PARALLEL) {
+      const batch = await Promise.all(targets.slice(i, i + OLDER_PARALLEL).map(fetchOlder));
+      for (const run of batch) if (run) runs.push(run);
     }
-    if (runs.length) prependOlder(runs);
+    if (runs.length) await prependOlder(runs);
   } finally {
     loadingOlder = false;
   }
 }
 
+// prependOlder inserts a fetched page above the current view. A page can
+// be thousands of lines across several files, and building that many nodes
+// in one go would drop frames right when the user is scrolling — so it is
+// built and inserted a slice per frame, oldest slice last, with the
+// viewport re-anchored after every slice so the lines being read never
+// move. Resolves once the whole page is in.
 function prependOlder(runs) {
-  const frag = document.createDocumentFragment();
+  const items = [];
   for (const run of runs) {
-    frag.appendChild(divider(
-      (run.atStart ? "start of " : "older · ") + run.f.name, false));
-    let shown = 0;
+    items.push({ label: (run.atStart ? "start of " : "older · ") + run.f.name });
     for (const ln of run.lines) {
       const ev = { file: run.f.id, text: ln.text, off: ln.off, time: null };
-      if (!matches(ev)) continue;
-      frag.appendChild(buildLine(ev));
-      shown++;
-    }
-    olderCount += shown;
-  }
-  const prevHeight = logEl.scrollHeight;
-  const prevTop = logEl.scrollTop;
-  olderEl.insertBefore(frag, olderEl.firstChild);
-  // Keep the viewport anchored on the lines the user was reading.
-  programmaticScroll(prevTop + (logEl.scrollHeight - prevHeight));
-  // Bound the window: unload the newest part of the scrollback (the part
-  // the user already scrolled past) and mark the seam.
-  if (olderCount > OLDER_MAX) {
-    if (!olderEl.lastElementChild || !olderEl.lastElementChild.classList.contains("gap")) {
-      olderEl.appendChild(divider("· · · unloaded — jump to latest to reset · · ·", true));
-    }
-    const gapEl = olderEl.lastElementChild;
-    while (olderCount > OLDER_MAX && gapEl.previousElementSibling) {
-      const n = gapEl.previousElementSibling;
-      if (n.classList.contains("line")) olderCount--;
-      n.remove();
+      if (matches(ev)) items.push({ ev });
     }
   }
-  updateHud();
+  return new Promise((resolve) => {
+    let end = items.length;
+    const step = () => {
+      // Slices are inserted back to front, each above the previous one, so
+      // the finished block reads in its original order.
+      const start = Math.max(0, end - OLDER_CHUNK);
+      const frag = document.createDocumentFragment();
+      let shown = 0;
+      for (let i = start; i < end; i++) {
+        const it = items[i];
+        if (it.label !== undefined) {
+          frag.appendChild(divider(it.label, false));
+          continue;
+        }
+        frag.appendChild(buildLine(it.ev));
+        shown++;
+      }
+      const prevHeight = logEl.scrollHeight;
+      const prevTop = logEl.scrollTop;
+      olderEl.insertBefore(frag, olderEl.firstChild);
+      olderCount += shown;
+      // Keep the viewport anchored on the lines the user was reading.
+      programmaticScroll(prevTop + (logEl.scrollHeight - prevHeight));
+      end = start;
+      if (end > 0) {
+        requestAnimationFrame(step);
+        return;
+      }
+      trimOlder();
+      updateHud();
+      resolve();
+    };
+    requestAnimationFrame(step);
+  });
+}
+
+// trimOlder bounds the window: it unloads the newest part of the
+// scrollback (the part the user already scrolled past) and marks the seam.
+function trimOlder() {
+  if (olderCount <= OLDER_MAX) return;
+  if (!olderEl.lastElementChild || !olderEl.lastElementChild.classList.contains("gap")) {
+    olderEl.appendChild(divider("· · · unloaded — jump to latest to reset · · ·", true));
+  }
+  const gapEl = olderEl.lastElementChild;
+  while (olderCount > OLDER_MAX && gapEl.previousElementSibling) {
+    const n = gapEl.previousElementSibling;
+    if (n.classList.contains("line")) olderCount--;
+    n.remove();
+  }
 }
 
 function setStatus(cls, text) {
@@ -776,20 +844,37 @@ jumpBtn.addEventListener("click", () => {
 // when the user deliberately comes back down to the tail (or hits "Jump to
 // latest"). Programmatic scrolls are ignored via ignoreScrollUntil.
 let lastScrollTop = 0;
+let scrollTicking = false;
 logEl.addEventListener("scroll", () => {
+  // The handler measures and writes, so it runs once per frame at most
+  // rather than once per scroll event — the browser fires those far
+  // faster than it paints, and doing layout work in each one is what
+  // makes a fast flick feel notchy.
+  if (scrollTicking) return;
+  scrollTicking = true;
+  requestAnimationFrame(() => {
+    scrollTicking = false;
+    onScrollFrame();
+  });
+}, { passive: true });
+
+function onScrollFrame() {
   const st = logEl.scrollTop;
   const scrolledUp = st < lastScrollTop;
   lastScrollTop = st;
-  jumpBtn.hidden = nearBottom() && olderCount === 0;
+  const atBottom = nearBottom();
+  setJumpHidden(atBottom && olderCount === 0);
   if (performance.now() < ignoreScrollUntil) return;
-  if (scrolledUp && st < 300 && logEl.scrollHeight > logEl.clientHeight) {
+  // The next page starts well before the top is reached, so the fetch
+  // overlaps the remaining scrolling instead of stalling at the edge.
+  if (scrolledUp && st < OLDER_TRIGGER && logEl.scrollHeight > logEl.clientHeight) {
     loadOlder();
-  } else if (!scrolledUp && olderCount > 0 && nearBottom()) {
+  } else if (!scrolledUp && olderCount > 0 && atBottom) {
     clearOlder();
     programmaticScroll(logEl.scrollHeight);
     updateHud();
   }
-}, { passive: true });
+}
 
 // A wheel-up at the very top produces no scroll event; catch it so
 // scrollback also starts when the content is shorter than the viewport.

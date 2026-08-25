@@ -88,6 +88,9 @@ func run() error {
 				"(e.g. '/var/log/*.log', quoted so the shell passes them through)\n"+
 				"expand to their matches. Directories and patterns are re-scanned\n"+
 				"every -rescan, picking up files created or deleted later.\n"+
+				"An argument may end in :alias to name the source: on a file the\n"+
+				"alias is the name, on a directory or glob it prefixes each file\n"+
+				"(e.g. '/var/log/myapp/:worker1' -> worker1/app.log).\n"+
 				"Files and flag defaults may also come from a config file, searched at:\n\n\t%s\n\nFlags:\n",
 			strings.Join(config.DefaultPaths(), "\n\t"))
 		flag.PrintDefaults()
@@ -218,13 +221,14 @@ func run() error {
 	// their current files are tailed and the argument is re-expanded every
 	// -rescan so files created or deleted later are picked up. With it
 	// disabled everything expands once at startup, as before.
-	var watchArgs []string
+	logArgs := parseLogArgs(args)
+	var watchArgs []logArg
 	if *rescan > 0 {
-		args, watchArgs = splitWatchArgs(args)
+		logArgs, watchArgs = splitWatchArgs(logArgs)
 	}
-	var paths []string
-	if len(args) > 0 {
-		paths, err = resolvePaths(args, logger)
+	var sources []logSource
+	if len(logArgs) > 0 {
+		sources, err = resolvePaths(logArgs, logger)
 		if err != nil {
 			flag.Usage()
 			return err
@@ -235,15 +239,15 @@ func run() error {
 	}
 	// staticIDs keeps watched scans from double-tailing a file that is
 	// already tailed via a plain argument.
-	staticIDs := make(map[string]bool, len(paths))
-	for _, p := range paths {
-		if id, idErr := pathIdentity(p); idErr == nil {
+	staticIDs := make(map[string]bool, len(sources))
+	for _, src := range sources {
+		if id, idErr := pathIdentity(src.path); idErr == nil {
 			staticIDs[id] = true
 		}
 	}
-	var dynPaths []string
+	var dynSources []logSource
 	if len(watchArgs) > 0 {
-		dynPaths = scanWatchArgs(watchArgs, staticIDs, maxTailedFiles-len(paths), logger)
+		dynSources = scanWatchArgs(watchArgs, staticIDs, maxTailedFiles-len(sources), logger)
 	}
 	if *uiLines <= 0 {
 		return fmt.Errorf("-lines must be positive, got %d", *uiLines)
@@ -256,7 +260,7 @@ func run() error {
 			return err
 		}
 	}
-	if *headless && *forwardTo == "" && !*dockerOn && len(paths) == 0 {
+	if *headless && *forwardTo == "" && !*dockerOn && len(sources) == 0 {
 		logger.Warn("headless with nothing to forward or view — probably a misconfiguration")
 	}
 
@@ -299,8 +303,8 @@ func run() error {
 	// namer maps tailed paths to the display names used when forwarding
 	// (and when registering Docker containers with the local UI).
 	namer := newSourceNamer()
-	for _, p := range paths {
-		namer.set(p, filepath.Base(p))
+	for _, src := range sources {
+		namer.set(src.path, src.name)
 	}
 
 	var fwd *forward.Client
@@ -326,8 +330,8 @@ func run() error {
 		Logger:       logger,
 	}
 	var tailers sync.WaitGroup
-	for _, p := range paths {
-		t := tail.New(p, tailOpts)
+	for _, src := range sources {
+		t := tail.New(src.path, tailOpts)
 		tailers.Add(1)
 		go func() {
 			defer tailers.Done()
@@ -341,8 +345,14 @@ func run() error {
 		if cfg != nil {
 			ingestTokens = cfg.Ingest
 		}
+		all := append(append([]logSource(nil), sources...), dynSources...)
+		names := make(map[string]string, len(all))
+		for _, src := range all {
+			names[src.path] = src.name
+		}
 		srv = server.New(h, server.Options{
-			Files:        append(append([]string(nil), paths...), dynPaths...),
+			Files:        sourcePaths(all),
+			Names:        names,
 			Lines:        *uiLines,
 			AuthUser:     authUser,
 			AuthPass:     authPass,
@@ -392,13 +402,15 @@ func run() error {
 	if len(watchArgs) > 0 {
 		group := tailgroup.NewGroup(ctx, lines, tailOpts)
 		prev := make(map[string]bool)
-		reconcile := func(found []string) {
+		reconcile := func(found []logSource) {
 			current := make(map[string]bool, len(found))
-			for _, p := range found {
-				current[p] = true
-				namer.set(p, filepath.Base(p))
+			paths := make([]string, 0, len(found))
+			for _, src := range found {
+				current[src.path] = true
+				paths = append(paths, src.path)
+				namer.set(src.path, src.name)
 				if srv != nil {
-					srv.RegisterSource(p, filepath.Base(p), true)
+					srv.RegisterSource(src.path, src.name, true)
 				}
 			}
 			for p := range prev {
@@ -410,14 +422,14 @@ func run() error {
 				}
 			}
 			prev = current
-			group.Reconcile(found)
+			group.Reconcile(paths)
 		}
-		limit := maxTailedFiles - len(paths)
+		limit := maxTailedFiles - len(sources)
 		tailers.Add(1)
 		go func() {
 			defer tailers.Done()
 			defer group.Stop()
-			reconcile(dynPaths)
+			reconcile(dynSources)
 			ticker := time.NewTicker(*rescan)
 			defer ticker.Stop()
 			for {
@@ -429,7 +441,7 @@ func run() error {
 				}
 			}
 		}()
-		logger.Info("watching for log file changes", "args", watchArgs, "rescan", *rescan)
+		logger.Info("watching for log file changes", "args", argSpecs(watchArgs), "rescan", *rescan)
 	}
 
 	publisherDone := make(chan struct{})
@@ -469,12 +481,12 @@ func run() error {
 		logger.Info("peekastokk listening",
 			"version", version,
 			"url", fmt.Sprintf("http://%s/", listener.Addr()),
-			"files", paths)
+			"files", sourcePaths(sources))
 	} else {
 		logger.Info("peekastokk headless",
 			"version", version,
 			"forward_to", *forwardTo,
-			"files", paths,
+			"files", sourcePaths(sources),
 			"docker", *dockerOn)
 	}
 	var statusSrv *http.Server
@@ -650,7 +662,7 @@ const maxTailedFiles = 1000
 // info level so overlapping arguments (the same file via a directory and
 // explicitly, overlapping globs, symlink aliases) are visible rather than
 // silent.
-func resolvePaths(args []string, logger *slog.Logger) ([]string, error) {
+func resolvePaths(args []logArg, logger *slog.Logger) ([]logSource, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -658,50 +670,50 @@ func resolvePaths(args []string, logger *slog.Logger) ([]string, error) {
 		return nil, errors.New(`at least one log file, directory, or glob pattern is required (as arguments or "file =" entries in a config file)`)
 	}
 	seen := make(map[string]string, len(args)) // identity -> path as first added
-	var paths []string
+	var sources []logSource
 	for _, arg := range args {
 		expanded, err := expandArg(arg)
 		if err != nil {
 			return nil, err
 		}
 		added := 0
-		for _, p := range expanded {
-			id, err := pathIdentity(p)
+		for _, src := range expanded {
+			id, err := pathIdentity(src.path)
 			if err != nil {
-				return nil, fmt.Errorf("%s: %w", p, err)
+				return nil, fmt.Errorf("%s: %w", src.path, err)
 			}
 			if first, dup := seen[id]; dup {
-				if first == p {
-					logger.Info("skipping duplicate log file", "file", p)
+				if first == src.path {
+					logger.Info("skipping duplicate log file", "file", src.path)
 				} else {
-					logger.Info("skipping duplicate log file", "file", p, "already_tailed_as", first)
+					logger.Info("skipping duplicate log file", "file", src.path, "already_tailed_as", first)
 				}
 				continue
 			}
-			seen[id] = p
-			paths = append(paths, p)
+			seen[id] = src.path
+			sources = append(sources, src)
 			added++
 		}
 		if added == 0 && len(expanded) > 1 {
-			logger.Info("argument only named files that are already tailed", "arg", arg)
+			logger.Info("argument only named files that are already tailed", "arg", arg.spec)
 		}
 	}
-	if len(paths) > maxTailedFiles {
-		return nil, fmt.Errorf("arguments expand to %d files, more than the maximum of %d", len(paths), maxTailedFiles)
+	if len(sources) > maxTailedFiles {
+		return nil, fmt.Errorf("arguments expand to %d files, more than the maximum of %d", len(sources), maxTailedFiles)
 	}
-	return paths, nil
+	return sources, nil
 }
 
 // splitWatchArgs separates arguments naming a changing set of files —
 // directories and glob patterns — from plain file paths. Only used when
 // re-scanning is enabled.
-func splitWatchArgs(args []string) (plain, watch []string) {
+func splitWatchArgs(args []logArg) (plain, watch []logArg) {
 	for _, a := range args {
-		if strings.ContainsAny(a, "*?[") {
+		if strings.ContainsAny(a.spec, "*?[") {
 			watch = append(watch, a)
 			continue
 		}
-		if info, err := os.Stat(a); err == nil && info.IsDir() {
+		if info, err := os.Stat(a.spec); err == nil && info.IsDir() {
 			watch = append(watch, a)
 			continue
 		}
@@ -716,34 +728,34 @@ func splitWatchArgs(args []string) (plain, watch []string) {
 // startup resolution, an argument currently yielding nothing is normal
 // here — files coming and going is the whole point — so it is logged at
 // debug rather than treated as an error.
-func scanWatchArgs(watchArgs []string, exclude map[string]bool, limit int, logger *slog.Logger) []string {
+func scanWatchArgs(watchArgs []logArg, exclude map[string]bool, limit int, logger *slog.Logger) []logSource {
 	seen := make(map[string]bool)
-	var paths []string
+	var sources []logSource
 	for _, arg := range watchArgs {
 		expanded, err := expandArg(arg)
 		if err != nil {
-			logger.Debug("watched argument yields no files", "arg", arg, "reason", err)
+			logger.Debug("watched argument yields no files", "arg", arg.spec, "reason", err)
 			continue
 		}
-		for _, p := range expanded {
-			id, err := pathIdentity(p)
+		for _, src := range expanded {
+			id, err := pathIdentity(src.path)
 			if err != nil {
-				logger.Debug("skipping unresolvable path", "file", p, "error", err)
+				logger.Debug("skipping unresolvable path", "file", src.path, "error", err)
 				continue
 			}
 			if exclude[id] || seen[id] {
 				continue
 			}
 			seen[id] = true
-			paths = append(paths, p)
+			sources = append(sources, src)
 		}
 	}
-	if len(paths) > limit {
+	if len(sources) > limit {
 		logger.Warn("watched arguments yield more files than the limit; ignoring the extra ones",
-			"found", len(paths), "limit", limit)
-		paths = paths[:limit]
+			"found", len(sources), "limit", limit)
+		sources = sources[:limit]
 	}
-	return paths
+	return sources
 }
 
 // pathIdentity returns a canonical form of p for duplicate detection:
@@ -760,7 +772,67 @@ func pathIdentity(p string) (string, error) {
 	return abs, nil // not created yet: the literal path is its identity
 }
 
-// expandArg turns one CLI/config entry into concrete file paths:
+// logArg is one log-source entry as written on the command line or in a
+// "file =" config line: a path, directory, or glob pattern, plus the
+// optional display alias given as "<arg>:<alias>".
+type logArg struct {
+	spec  string
+	alias string
+}
+
+// logSource is one concrete log file: the path tailed, and the display
+// name it appears under in the UI and in forwarded lines.
+type logSource struct {
+	path string
+	name string
+}
+
+// parseLogArgs splits the optional ":alias" suffix off each argument.
+func parseLogArgs(args []string) []logArg {
+	out := make([]logArg, len(args))
+	for i, a := range args {
+		spec, alias := config.SplitAlias(a)
+		out[i] = logArg{spec: spec, alias: alias}
+	}
+	return out
+}
+
+// argSpecs returns just the path/pattern of each argument, for logging.
+func argSpecs(args []logArg) []string {
+	specs := make([]string, len(args))
+	for i, a := range args {
+		specs[i] = a.spec
+	}
+	return specs
+}
+
+// sourcePaths returns just the paths of srcs, for the callers that only
+// tail or log them.
+func sourcePaths(srcs []logSource) []string {
+	paths := make([]string, len(srcs))
+	for i, src := range srcs {
+		paths[i] = src.path
+	}
+	return paths
+}
+
+// sourceName is the display name for path under alias. On a plain file the
+// alias replaces the base name outright; on a directory or glob — which
+// expand to many files — it prefixes each base name instead, so the files
+// stay distinct (e.g. "worker1/app.log").
+func sourceName(alias, path string, expanded bool) string {
+	base := filepath.Base(path)
+	switch {
+	case alias == "":
+		return base
+	case expanded:
+		return alias + "/" + base
+	default:
+		return alias
+	}
+}
+
+// expandArg turns one CLI/config entry into concrete log sources:
 //
 //   - a directory expands to the regular files directly inside it
 //     (dot-files and subdirectories are skipped, non-recursively)
@@ -771,45 +843,45 @@ func pathIdentity(p string) (string, error) {
 // Expansion happens once at startup; files created later only appear via a
 // plain path, not via patterns. A pattern or directory that yields no files
 // is an error rather than a silently empty viewer.
-func expandArg(arg string) ([]string, error) {
-	if strings.ContainsAny(arg, "*?[") {
-		matches, err := filepath.Glob(arg)
+func expandArg(arg logArg) ([]logSource, error) {
+	if strings.ContainsAny(arg.spec, "*?[") {
+		matches, err := filepath.Glob(arg.spec)
 		if err != nil {
-			return nil, fmt.Errorf("%s: invalid pattern: %w", arg, err)
+			return nil, fmt.Errorf("%s: invalid pattern: %w", arg.spec, err)
 		}
-		var files []string
+		var files []logSource
 		for _, m := range matches {
 			if info, err := os.Stat(m); err == nil && info.Mode().IsRegular() {
-				files = append(files, m)
+				files = append(files, logSource{m, sourceName(arg.alias, m, true)})
 			}
 		}
 		if len(files) == 0 {
-			return nil, fmt.Errorf("%s: no files match the pattern", arg)
+			return nil, fmt.Errorf("%s: no files match the pattern", arg.spec)
 		}
 		return files, nil
 	}
 
-	if info, err := os.Stat(arg); err == nil && info.IsDir() {
-		entries, err := os.ReadDir(arg)
+	if info, err := os.Stat(arg.spec); err == nil && info.IsDir() {
+		entries, err := os.ReadDir(arg.spec)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", arg, err)
+			return nil, fmt.Errorf("%s: %w", arg.spec, err)
 		}
-		var files []string
+		var files []logSource
 		for _, e := range entries {
 			if strings.HasPrefix(e.Name(), ".") {
 				continue
 			}
-			p := filepath.Join(arg, e.Name())
+			p := filepath.Join(arg.spec, e.Name())
 			// Stat (not e.Type) so symlinks to regular files count too.
 			if info, err := os.Stat(p); err == nil && info.Mode().IsRegular() {
-				files = append(files, p)
+				files = append(files, logSource{p, sourceName(arg.alias, p, true)})
 			}
 		}
 		if len(files) == 0 {
-			return nil, fmt.Errorf("%s: directory contains no files", arg)
+			return nil, fmt.Errorf("%s: directory contains no files", arg.spec)
 		}
 		return files, nil
 	}
 
-	return []string{arg}, nil
+	return []logSource{{arg.spec, sourceName(arg.alias, arg.spec, false)}}, nil
 }

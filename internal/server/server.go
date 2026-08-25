@@ -50,6 +50,10 @@ type fileEntry struct {
 type Options struct {
 	// Files is the list of tailed paths.
 	Files []string
+	// Names optionally overrides the display name of a path in Files
+	// (an alias given as "<file>:<alias>"). Paths absent from the map
+	// keep their base name.
+	Names map[string]string
 	// Lines is the default number of lines the UI keeps on screen.
 	Lines int
 	// AuthUser/AuthPass enable HTTP basic authentication for everything
@@ -117,7 +121,7 @@ func New(h *hub.Hub, opts Options) *Server {
 		log:      opts.Logger,
 		mux:      http.NewServeMux(),
 	}
-	names := displayNames(opts.Files)
+	names := displayNames(opts.Files, opts.Names)
 	for i, path := range opts.Files {
 		s.reg.register(path, names[i], entryLocal)
 	}

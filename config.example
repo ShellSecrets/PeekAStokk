@@ -70,8 +70,16 @@ log-level = info
 # directory. Plain files that do not exist yet are waited for.
 # Directories mean every file directly inside them, and glob patterns
 # (*.log, myproject*, ...) expand at startup.
+#
+# An optional ":alias" suffix renames the source in the file picker (and
+# in what a forwarding client sends): on a plain file the alias is the
+# name, on a directory or glob it prefixes each file's own name, so
+# same-named logs from different places stay apart.
 file = /var/log/system.log
 file = ~/logs/app.log
+#file = /srv/app/current/log/production.log:app     ; shown as "app"
+#file = ~/logs/myapp/:worker1                       ; "worker1/<file>"
+#file = /var/log/nginx/*.log:edge                   ; "edge/access.log", ...
 #file = ~/logs/myapp/
 #file = /var/log/nginx/*.log
 #file = "/var/log/name with spaces.log"

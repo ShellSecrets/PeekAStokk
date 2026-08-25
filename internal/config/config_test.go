@@ -351,3 +351,40 @@ func TestXDGDefaultsToDotConfig(t *testing.T) {
 		t.Fatalf("Path = %q", cfg.Path)
 	}
 }
+
+func TestSplitAlias(t *testing.T) {
+	for _, tc := range []struct {
+		arg, path, alias string
+	}{
+		{"/var/log/app.log", "/var/log/app.log", ""},
+		{"/var/log/app.log:web", "/var/log/app.log", "web"},
+		{"/var/log/myapp/:worker1", "/var/log/myapp/", "worker1"},
+		{"/var/log/*.log:worker-1", "/var/log/*.log", "worker-1"},
+		{"/var/log/a:b.log:web", "/var/log/a:b.log", "web"},
+		{"/var/log/app.log:", "/var/log/app.log:", ""}, // empty alias
+		{":web", ":web", ""}, // empty path
+		{"/var/log/app.log:a/b", "/var/log/app.log:a/b", ""}, // '/' is not alias material
+		{"/var/log/app.log:two words", "/var/log/app.log:two words", ""},
+	} {
+		path, alias := config.SplitAlias(tc.arg)
+		if path != tc.path || alias != tc.alias {
+			t.Errorf("SplitAlias(%q) = (%q, %q), want (%q, %q)", tc.arg, path, alias, tc.path, tc.alias)
+		}
+	}
+}
+
+func TestLoadFileAliasResolvesOnlyThePath(t *testing.T) {
+	isolateHome(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config")
+	writeFile(t, path, "file = logs/app.log:web\nfile = /var/log/other.log\n")
+
+	c, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{filepath.Join(dir, "logs", "app.log") + ":web", "/var/log/other.log"}
+	if len(c.Files) != 2 || c.Files[0] != want[0] || c.Files[1] != want[1] {
+		t.Fatalf("Files = %v, want %v", c.Files, want)
+	}
+}

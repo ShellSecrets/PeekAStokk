@@ -9,13 +9,15 @@
 //	log-level = debug
 //
 //	file = /var/log/app.log
-//	file = ~/logs/worker.log    # repeat "file" for each log
+//	file = ~/logs/worker.log      # repeat "file" for each log
+//	file = ~/logs/myapp/:worker1  # ":alias" names the source
 //
 // Blank lines and lines starting with # or ; are ignored, as is an
 // unquoted trailing "  # comment". Values may be double- or single-quoted
 // to preserve leading/trailing spaces or a literal #. In "file" values a
-// leading ~ expands to the home directory and relative paths are resolved
-// against the directory containing the config file. Every key except
+// leading ~ expands to the home directory, relative paths are resolved
+// against the directory containing the config file, and an optional
+// trailing ":alias" (see SplitAlias) sets the display name. Every key except
 // "file" may appear at most once.
 //
 // Unless an explicit path is given, the file is looked up in (first match
@@ -221,8 +223,15 @@ func parse(text, baseDir string) (*Config, error) {
 			}
 			c.Auth = value
 		case "file":
+			// The optional ":alias" suffix is split off so only the path
+			// portion is expanded, then re-attached for the expansion to
+			// pick up again.
+			raw, alias := SplitAlias(value)
 			var p string
-			p, err = resolveFilePath(value, baseDir)
+			p, err = resolveFilePath(raw, baseDir)
+			if alias != "" {
+				p += ":" + alias
+			}
 			c.Files = append(c.Files, p)
 		case "forward-to":
 			if value == "" {
@@ -349,4 +358,27 @@ func resolveFilePath(value, baseDir string) (string, error) {
 		return filepath.Join(baseDir, value), nil
 	}
 	return value, nil
+}
+
+// SplitAlias separates an optional ":alias" display-name suffix from a
+// log-source argument (a file, directory, or glob pattern). The alias is
+// the text after the last colon when it is non-empty and contains only
+// letters, digits, '.', '_' and '-'; anything else — including a path
+// whose own last segment happens to follow a colon — leaves the argument
+// untouched with an empty alias. A path that does contain a colon can
+// still be given an alias explicitly, since only the last colon splits.
+func SplitAlias(arg string) (path, alias string) {
+	i := strings.LastIndex(arg, ":")
+	if i <= 0 || i == len(arg)-1 {
+		return arg, ""
+	}
+	for _, r := range arg[i+1:] {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.', r == '_', r == '-':
+		default:
+			return arg, ""
+		}
+	}
+	return arg[:i], arg[i+1:]
 }

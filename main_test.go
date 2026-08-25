@@ -22,10 +22,19 @@ func write(t *testing.T, path string) {
 	}
 }
 
-func names(paths []string) []string {
-	out := make([]string, len(paths))
-	for i, p := range paths {
-		out[i] = filepath.Base(p)
+func names(srcs []logSource) []string {
+	out := make([]string, len(srcs))
+	for i, src := range srcs {
+		out[i] = filepath.Base(src.path)
+	}
+	return out
+}
+
+// displayed returns the display names the sources forward and register as.
+func displayed(srcs []logSource) []string {
+	out := make([]string, len(srcs))
+	for i, src := range srcs {
+		out[i] = src.name
 	}
 	return out
 }
@@ -37,7 +46,7 @@ func TestResolvePathsExpandsDirectory(t *testing.T) {
 	write(t, filepath.Join(dir, ".hidden"))
 	write(t, filepath.Join(dir, "sub", "nested.log")) // subdir itself must be skipped
 
-	paths, err := resolvePaths([]string{dir}, quiet)
+	paths, err := resolvePaths(parseLogArgs([]string{dir}), quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +64,7 @@ func TestResolvePathsExpandsGlobs(t *testing.T) {
 	write(t, filepath.Join(dir, "myproject-a.out"))
 	write(t, filepath.Join(dir, "myproject-b.out"))
 
-	paths, err := resolvePaths([]string{filepath.Join(dir, "*.log")}, quiet)
+	paths, err := resolvePaths(parseLogArgs([]string{filepath.Join(dir, "*.log")}), quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +72,7 @@ func TestResolvePathsExpandsGlobs(t *testing.T) {
 		t.Fatalf("*.log -> %v", got)
 	}
 
-	paths, err = resolvePaths([]string{filepath.Join(dir, "myproject*")}, quiet)
+	paths, err = resolvePaths(parseLogArgs([]string{filepath.Join(dir, "myproject*")}), quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +88,7 @@ func TestResolvePathsGlobSkipsDirectories(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	paths, err := resolvePaths([]string{filepath.Join(dir, "*")}, quiet)
+	paths, err := resolvePaths(parseLogArgs([]string{filepath.Join(dir, "*")}), quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +108,7 @@ func TestResolvePathsErrors(t *testing.T) {
 		"empty directory":   {empty},
 		"no args":           {},
 	} {
-		if _, err := resolvePaths(args, quiet); err == nil {
+		if _, err := resolvePaths(parseLogArgs(args), quiet); err == nil {
 			t.Errorf("%s: expected error", name)
 		}
 	}
@@ -110,11 +119,11 @@ func TestResolvePathsKeepsMissingPlainPathAndDedupes(t *testing.T) {
 	write(t, filepath.Join(dir, "a.log"))
 
 	// A future file is kept; the same file via dir and explicitly is deduped.
-	paths, err := resolvePaths([]string{
+	paths, err := resolvePaths(parseLogArgs([]string{
 		filepath.Join(dir, "future.log"),
 		dir,
 		filepath.Join(dir, "a.log"),
-	}, quiet)
+	}), quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,11 +143,11 @@ func TestResolvePathsLogsDuplicates(t *testing.T) {
 
 	// a.log arrives via the directory, explicitly, and through a glob; the
 	// glob adds nothing new at all.
-	paths, err := resolvePaths([]string{
+	paths, err := resolvePaths(parseLogArgs([]string{
 		dir,
 		filepath.Join(dir, "a.log"),
 		filepath.Join(dir, "*.log"),
-	}, logger)
+	}), logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,11 +177,11 @@ func TestResolvePathsDedupesSymlinkAliases(t *testing.T) {
 
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
-	paths, err := resolvePaths([]string{target, link}, logger)
+	paths, err := resolvePaths(parseLogArgs([]string{target, link}), logger)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(paths) != 1 || paths[0] != target {
+	if len(paths) != 1 || paths[0].path != target {
 		t.Fatalf("paths = %v, want just the target", paths)
 	}
 	if !strings.Contains(buf.String(), "already_tailed_as") {
@@ -186,7 +195,7 @@ func TestResolvePathsCapsFileCount(t *testing.T) {
 	for i := range args {
 		args[i] = filepath.Join(dir, "missing-", strings.Repeat("x", 3), "-", string(rune('a'+i%26)), "-", filepath.Base(t.TempDir()))
 	}
-	if _, err := resolvePaths(args, quiet); err == nil || !strings.Contains(err.Error(), "maximum") {
+	if _, err := resolvePaths(parseLogArgs(args), quiet); err == nil || !strings.Contains(err.Error(), "maximum") {
 		t.Fatalf("expected cap error, got %v", err)
 	}
 }
@@ -198,11 +207,11 @@ func TestSplitWatchArgs(t *testing.T) {
 	missing := filepath.Join(dir, "not-yet.log") // plain path that may appear later
 	glob := filepath.Join(dir, "*.log")
 
-	plain, watch := splitWatchArgs([]string{plainFile, dir, glob, missing})
-	if len(plain) != 2 || plain[0] != plainFile || plain[1] != missing {
+	plain, watch := splitWatchArgs(parseLogArgs([]string{plainFile, dir, glob, missing}))
+	if len(plain) != 2 || plain[0].spec != plainFile || plain[1].spec != missing {
 		t.Errorf("plain = %v", plain)
 	}
-	if len(watch) != 2 || watch[0] != dir || watch[1] != glob {
+	if len(watch) != 2 || watch[0].spec != dir || watch[1].spec != glob {
 		t.Errorf("watch = %v", watch)
 	}
 }
@@ -212,20 +221,20 @@ func TestScanWatchArgsTracksCreationAndDeletion(t *testing.T) {
 	a := filepath.Join(dir, "a.log")
 	write(t, a)
 
-	if got := names(scanWatchArgs([]string{dir}, nil, maxTailedFiles, quiet)); len(got) != 1 || got[0] != "a.log" {
+	if got := names(scanWatchArgs(parseLogArgs([]string{dir}), nil, maxTailedFiles, quiet)); len(got) != 1 || got[0] != "a.log" {
 		t.Fatalf("initial scan = %v", got)
 	}
 
 	b := filepath.Join(dir, "b.log")
 	write(t, b)
-	if got := names(scanWatchArgs([]string{dir}, nil, maxTailedFiles, quiet)); len(got) != 2 {
+	if got := names(scanWatchArgs(parseLogArgs([]string{dir}), nil, maxTailedFiles, quiet)); len(got) != 2 {
 		t.Fatalf("after creation = %v", got)
 	}
 
 	if err := os.Remove(a); err != nil {
 		t.Fatal(err)
 	}
-	if got := names(scanWatchArgs([]string{dir}, nil, maxTailedFiles, quiet)); len(got) != 1 || got[0] != "b.log" {
+	if got := names(scanWatchArgs(parseLogArgs([]string{dir}), nil, maxTailedFiles, quiet)); len(got) != 1 || got[0] != "b.log" {
 		t.Fatalf("after deletion = %v", got)
 	}
 }
@@ -243,15 +252,15 @@ func TestScanWatchArgsSkipsExcludedAndDuplicates(t *testing.T) {
 	}
 	// The directory and the overlapping glob both name b.log; a.log is
 	// already tailed statically.
-	got := scanWatchArgs([]string{dir, filepath.Join(dir, "*.log")},
+	got := scanWatchArgs(parseLogArgs([]string{dir, filepath.Join(dir, "*.log")}),
 		map[string]bool{id: true}, maxTailedFiles, quiet)
-	if len(got) != 1 || got[0] != b {
+	if len(got) != 1 || got[0].path != b {
 		t.Fatalf("scan = %v, want just %s", got, b)
 	}
 }
 
 func TestScanWatchArgsToleratesEmptinessAndCapsAtLimit(t *testing.T) {
-	if got := scanWatchArgs([]string{t.TempDir(), "/nonexistent/*.log"}, nil, maxTailedFiles, quiet); len(got) != 0 {
+	if got := scanWatchArgs(parseLogArgs([]string{t.TempDir(), "/nonexistent/*.log"}), nil, maxTailedFiles, quiet); len(got) != 0 {
 		t.Fatalf("empty scan = %v", got)
 	}
 
@@ -259,7 +268,57 @@ func TestScanWatchArgsToleratesEmptinessAndCapsAtLimit(t *testing.T) {
 	for _, n := range []string{"a.log", "b.log", "c.log"} {
 		write(t, filepath.Join(dir, n))
 	}
-	if got := scanWatchArgs([]string{dir}, nil, 2, quiet); len(got) != 2 {
+	if got := scanWatchArgs(parseLogArgs([]string{dir}), nil, 2, quiet); len(got) != 2 {
 		t.Fatalf("capped scan = %v, want 2 files", got)
+	}
+}
+
+func TestResolvePathsAppliesAliases(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "app.log"))
+	write(t, filepath.Join(dir, "error.log"))
+	plain := filepath.Join(t.TempDir(), "single.log")
+	write(t, plain)
+
+	// A plain file takes the alias as its whole name; a directory or glob
+	// prefixes it onto each expanded file's base name.
+	sources, err := resolvePaths(parseLogArgs([]string{
+		plain + ":web",
+		dir + ":worker1",
+	}), quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := displayed(sources)
+	want := []string{"web", "worker1/app.log", "worker1/error.log"}
+	if len(got) != len(want) {
+		t.Fatalf("names = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("names = %v, want %v", got, want)
+		}
+	}
+
+	// Without an alias the base name is unchanged.
+	sources, err = resolvePaths(parseLogArgs([]string{plain}), quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := displayed(sources); len(got) != 1 || got[0] != "single.log" {
+		t.Fatalf("unaliased names = %v", got)
+	}
+}
+
+func TestScanWatchArgsAppliesAliases(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "a.log"))
+	write(t, filepath.Join(dir, "notes.txt"))
+
+	got := displayed(scanWatchArgs(parseLogArgs([]string{
+		filepath.Join(dir, "*.log") + ":worker2",
+	}), nil, maxTailedFiles, quiet))
+	if len(got) != 1 || got[0] != "worker2/a.log" {
+		t.Fatalf("names = %v, want [worker2/a.log]", got)
 	}
 }

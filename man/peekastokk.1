@@ -45,6 +45,24 @@ are skipped. The pattern is re-scanned every
 like a directory; with re-scanning disabled, a pattern that matches
 nothing is a startup error.
 .PP
+Any argument may carry an
+.BI : alias
+suffix that sets the display name of what it expands to. On a
+.I logfile
+the alias is the name outright; on a
+.I directory
+or
+.I glob
+\(em which expand to many files \(em it prefixes each file's own base
+name (\fI/var/log/myapp/:worker1\fR becomes
+.IR worker1/app.log ", " worker1/error.log ", ...),"
+so same-named logs from different places stay apart. The alias may
+contain letters, digits, and
+.BR . ", " _ " and " \- ;
+only the last colon splits, so a path containing a colon still works
+(give it an explicit alias if its last segment looks like one). Aliases
+also name the source when forwarding.
+.PP
 If no arguments are given, the files listed as
 .B file
 entries in the configuration file are used instead (see
@@ -204,7 +222,9 @@ Every setting
 .B peekastokk
 accepts as a flag, plus a repeatable
 .B file
-entry for the tailed files, may instead live in a plain
+entry for the tailed files (each taking the same optional
+.BI : alias
+suffix as a command-line argument), may instead live in a plain
 .IR "key = value"
 configuration file. Command-line flags override the configuration file,
 which overrides built-in defaults; log files given as command-line

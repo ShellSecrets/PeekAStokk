@@ -510,3 +510,39 @@ func TestUnregisterHidesEntryAndReRegisterRevivesIt(t *testing.T) {
 		t.Fatalf("after no-op unregister: %v", got)
 	}
 }
+
+func TestFilesUseNameOverrides(t *testing.T) {
+	ts := httptest.NewServer(server.New(hub.New(10), server.Options{
+		Files: []string{"/var/log/w1/app.log", "/var/log/w2/app.log", "/var/log/plain.log"},
+		Names: map[string]string{
+			"/var/log/w1/app.log": "worker1/app.log",
+			"/var/log/w2/app.log": "worker2/app.log",
+		},
+		Lines: 500,
+	}).Handler())
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/api/files")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var body struct {
+		Files []struct {
+			Name string `json:"name"`
+		} `json:"files"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"worker1/app.log", "worker2/app.log", "plain.log"}
+	if len(body.Files) != len(want) {
+		t.Fatalf("files = %v, want %v", body.Files, want)
+	}
+	for i, w := range want {
+		if body.Files[i].Name != w {
+			t.Fatalf("files = %v, want %v", body.Files, want)
+		}
+	}
+}

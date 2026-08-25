@@ -34,6 +34,35 @@ restart needed. A plain path that doesn't exist yet is waited for. With
 `-rescan 0` everything expands once at startup instead, and an unmatched
 pattern or empty directory becomes a startup error.
 
+### Naming sources: `:alias`
+
+Sources are shown by their base name, so `app.log` from two different
+places looks the same twice. Append `:alias` to any file, directory, or
+pattern to name it yourself:
+
+```sh
+./peekastokk /srv/api/log/production.log:api   # shown as "api"
+./peekastokk '/var/log/myapp/:worker1'         # "worker1/app.log", ...
+./peekastokk '/var/log/nginx/*.log:edge'       # "edge/access.log", ...
+```
+
+On a plain file the alias *is* the name; on a directory or glob — which
+expand to many files — it prefixes each file's own name, keeping them
+distinct. The same suffix works on `file =` config entries:
+
+```ini
+file = /srv/api/log/production.log:api
+file = /var/log/myapp/:worker1
+```
+
+The alias may contain letters, digits, `.`, `_` and `-`. Only the last
+colon splits, so a path that itself contains a colon keeps working —
+give it an explicit alias if its last segment looks like one.
+
+Aliases apply to forwarding too: a client forwarding
+`/var/log/myapp/:worker1` shows up on the server as
+`<client-name>/worker1/app.log`.
+
 Or install directly:
 
 ```sh
@@ -207,7 +236,9 @@ docker-containers = api-*            ; glob; or "*" for all containers
 ```
 
 Forwarded sources appear in the server's file picker as
-`<client-name>/<source>` (e.g. `homelab-1/web`) — the client name comes
+`<client-name>/<source>` (e.g. `homelab-1/web`) — where `<source>` is the
+file's base name, a container's alias, or the [`:alias`](#naming-sources-alias)
+given to the `file =` entry — and the client name comes
 from the server's own `ingest =` line, so a client can never impersonate
 another. Lines stream live; while the connection is down the client
 buffers up to `forward-buffer-lines` in memory (oldest dropped beyond
